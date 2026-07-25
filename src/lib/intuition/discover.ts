@@ -77,7 +77,7 @@ export function findPeriodTransferCaveat(
   chainId: number,
 ): { enforcer: Address; terms: Hex } | null {
   const addrs = getAddresses(chainId)
-  const enforcers = [addrs.erc20PeriodTransferEnforcer, addrs.ourglass?.erc20PeriodTransferEnforcer]
+  const enforcers = [addrs.erc20PeriodTransferEnforcer, addrs.hourglass?.erc20PeriodTransferEnforcer]
     .filter((a): a is Address => Boolean(a))
     .map((a) => a.toLowerCase())
   return delegation.caveats.find((c) => enforcers.includes(c.enforcer.toLowerCase())) ?? null
@@ -109,10 +109,60 @@ export function findStreamingCaveat(
   delegation: DelegationStruct,
   chainId: number,
 ): { enforcer: Address; terms: Hex } | null {
-  const enforcers = [CANONICAL_STREAMING_ENFORCER, getAddresses(chainId).ourglass?.erc20StreamingEnforcer]
+  const enforcers = [CANONICAL_STREAMING_ENFORCER, getAddresses(chainId).hourglass?.erc20StreamingEnforcer]
     .filter((a): a is Address => Boolean(a))
     .map((a) => a.toLowerCase())
   return delegation.caveats.find((c) => enforcers.includes(c.enforcer.toLowerCase())) ?? null
+}
+
+export interface BalanceChangeTerms {
+  /** true = the balance may only DECREASE by at most `amount` (a spend cap). */
+  enforceDecrease: boolean
+  token: Address
+  /** The account whose balance is measured (the Safe, for a strategy mandate). */
+  recipient: Address
+  amount: bigint
+}
+
+/** Decode the erc20BalanceChange caveat terms: enforceDecrease(1) + token(20) + recipient(20) + amount(32) = 73 bytes. */
+export function decodeBalanceChangeTerms(terms: Hex): BalanceChangeTerms {
+  return {
+    enforceDecrease: hexToBigInt(sliceHex(terms, 0, 1)) !== 0n,
+    token: getAddress(sliceHex(terms, 1, 21)),
+    recipient: getAddress(sliceHex(terms, 21, 41)),
+    amount: hexToBigInt(sliceHex(terms, 41, 73)),
+  }
+}
+
+/**
+ * The mandate's max-spend caveat — the erc20BalanceChange **Decrease** on the
+ * funding token. A strategy mandate may carry a second balance-change caveat (an
+ * Increase = the price floor on the bought token), so match the Decrease
+ * specifically: its token is the funding token and its amount is the per-swap cap.
+ * The rail routes through the HourGlass enforcer instance (see environment.ts).
+ */
+export function findBalanceChangeCaveat(
+  delegation: DelegationStruct,
+  chainId: number,
+): { enforcer: Address; terms: Hex } | null {
+  const enforcers = [getAddresses(chainId).hourglass?.erc20BalanceChangeEnforcer]
+    .filter((a): a is Address => Boolean(a))
+    .map((a) => a.toLowerCase())
+  return (
+    delegation.caveats.find(
+      (c) => enforcers.includes(c.enforcer.toLowerCase()) && decodeBalanceChangeTerms(c.terms).enforceDecrease,
+    ) ?? null
+  )
+}
+
+/**
+ * Whether the mandate carries a limitedCalls caveat — the marker of a limit order
+ * (a single price-triggered swap) versus a recurring DCA. Both carry a
+ * balance-change Decrease; only the limit order caps the redemption count.
+ */
+export function hasLimitedCalls(delegation: DelegationStruct, chainId: number): boolean {
+  const hourglass = getAddresses(chainId).hourglass?.limitedCallsEnforcer?.toLowerCase()
+  return hourglass !== undefined && delegation.caveats.some((c) => c.enforcer.toLowerCase() === hourglass)
 }
 
 export function periodFromSeconds(seconds: bigint): string {
@@ -232,6 +282,25 @@ async function toStoredDelegation(
         startTime: Number(startTime),
         ratePerPeriod: formatUnits(amountPerSecond * MONTH_SECONDS, decimals),
         ratePeriod: 'month',
+      },
+    }
+  }
+
+  const mandate = findBalanceChangeCaveat(delegation, chainId)
+  if (mandate) {
+    const { token, amount, enforceDecrease } = decodeBalanceChangeTerms(mandate.terms)
+    const decimals = await tokenDecimals(chainId, token)
+    return {
+      delegation,
+      meta: {
+        ...common,
+        scopeType: 'strategyMandate',
+        status: 'signed',
+        // A limitedCalls cap marks a single-shot limit order; otherwise a DCA.
+        strategyKind: hasLimitedCalls(delegation, chainId) ? 'limitOrder' : 'dca',
+        tokenAddress: token,
+        capPerSwap: formatUnits(amount, decimals),
+        enforceDecrease,
       },
     }
   }

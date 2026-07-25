@@ -5,7 +5,6 @@ import { DeleGatorModuleFactoryABI, SafeABI } from '../config/abis'
 import { getAddresses } from '../config/addresses'
 import { buildModuleInstallTxs, DEFAULT_SALT } from '../lib/module'
 import { getDelegations, type StoredDelegation } from '../lib/storage'
-import { useFinalizePending } from '../hooks/useFinalizePending'
 import { portalAtomUrl } from '../lib/intuition'
 import { periodToSeconds, isPeriodType } from '../lib/enforcers'
 import { SubscriptionDetail } from './SubscriptionDetail'
@@ -87,9 +86,6 @@ function SubCard({ d, onOpen }: { d: StoredDelegation; onOpen: () => void }) {
 
 export default function Home({ onNavigate }: { onNavigate: (page: Page) => void }) {
   const { sdk, safe } = useSafeAppsSDK()
-  // Finalize-on-open: recover finalized delegations from the Safe tx-service and
-  // index them, independent of when the Nth owner signed (ADR 0005).
-  useFinalizePending()
   const [moduleStatus, setModuleStatus] = useState<'loading' | 'installed' | 'not-installed' | 'error'>('loading')
   const [moduleAddress, setModuleAddress] = useState<Address | null>(null)
   const [installing, setInstalling] = useState(false)
@@ -184,7 +180,7 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
             </div>
             <div className="min-w-0">
               <div className="text-sm font-semibold text-ink flex items-center gap-2">
-                OurGlass module enabled
+                HourGlass module enabled
                 <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-active"><IconCheck size={12} /> ready</span>
               </div>
               <div className="text-xs text-dim font-mono truncate">
@@ -198,7 +194,7 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
           <div className="flex items-start gap-3">
             <div className="grid place-items-center w-9 h-9 rounded-xl shrink-0 bg-raised text-danger ring-1 ring-line"><IconAlert size={18} /></div>
             <div className="flex-1 min-w-0">
-              <div className="text-sm font-semibold text-ink">OurGlass module not installed</div>
+              <div className="text-sm font-semibold text-ink">HourGlass module not installed</div>
               <p className="text-xs text-dim mt-1 leading-relaxed">Enable the DeleGator (ERC-7710) module on your Safe to start creating subscriptions. One-time setup — all signers approve.</p>
               {moduleAddress && <p className="text-[11px] text-faint font-mono mt-2 truncate">module: {moduleAddress}</p>}
               <div className="mt-3">

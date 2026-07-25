@@ -2,6 +2,25 @@
 
 Deferred ideas captured during tasks (per workflow rules — scope discipline).
 
+- **[COST] Agent gas residue has no return path to the Safe.** Per ADR 0007 the agent
+  wallet is funded from the Safe after the mandate is signed, and pays its own gas for
+  `redeemDelegations`. Whatever it does not spend stays on an address whose key only
+  the agent runtime holds — `ModuleTransfer` sweeps the DeleGator module, not the agent
+  wallet. Under limit-order-only scope a mandate fires once, so the leftover is the
+  top-up minus one redeem; a mandate whose trigger price never hits strands the whole
+  amount indefinitely.
+
+  **Accepted as a known loss for v1** (user decision, 2026-07-25) — bounded by the
+  top-up size, so keep the funding sized to one redeem plus a modest margin.
+
+  **What closing it needs:** a sweep instruction in the runner returning the balance to
+  the Safe, on three triggers — after a successful fill, after `disableDelegation`, and
+  on abandonment. The third is the hard one: an unfilled limit order emits no on-chain
+  event saying "this is over", so abandonment needs either an operator action in the
+  app or an expiry (a `TimestampEnforcer` on the mandate would give the runner a
+  deadline to sweep against). Revisit alongside the DCA rail, which turns this from a
+  one-shot leftover into a recurring top-up/refill problem.
+
 - **[DCA] The DCA rail needs the same Permit2 setup the limit order got.** Proven on
   the limit order: the Uniswap Universal Router 2.0 pulls the funding token through
   Permit2 (verified — `check_approval` always returns the Permit2 spender on Base, no

@@ -8,7 +8,7 @@
     "dca": "bun run-dca.ts"
   },
   "dependencies": {
-    "@metamask/smart-accounts-kit": "^1.7.0",
+    "@metamask/smart-accounts-kit": "^0.3.0",
     "viem": "^2.55.8"
   }
 }

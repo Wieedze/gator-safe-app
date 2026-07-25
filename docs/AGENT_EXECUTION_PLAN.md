@@ -61,6 +61,10 @@ Two hard ordering constraints:
   supplied to the runtime** — decided 2026-07-25. One shared key across mandates; its
   cost and rate limits are a later problem, explicitly not designed for here.
 - Stable agent address across restarts and redeploys — the mandate is signed to it.
+- **Dies on revocation.** Each poll iteration checks the mandate's disabled state on the
+  `DelegationManager` before quoting. Disabled means the instance exits — it has nothing
+  left it is allowed to do, and a redeem would revert with `CannotUseADisabledDelegation`
+  anyway. No new surface: the runtime already talks to that contract.
 - **No status endpoint.** The runtime is *triggered*, not polled: the app starts it and
   reads progress from what already exists — the mandate on Intuition, the fill on-chain.
   Decided 2026-07-25.
@@ -92,7 +96,9 @@ verify:
 - (c) What a host reboot does to a running app and its derived key. The README notes
   *"a VM reboot clears both the state and the RTMRs"* without saying what that means for
   the key.
-- (d) The per-minute billing rate, priced against a multi-week idle wait.
+- (d) The per-minute billing rate. **Informational only for the demo** — Hourglass pays
+  the compute from its own 0G deposit, and a demo order fills in minutes. Priced here
+  just so the multi-week idle case is a known number, not a surprise later.
 
 Nothing here is verified yet; the address-stability reasoning is read off the README
 (HKDF from the `app_id` namespace, "hardware-independent app secrets"), not measured.
@@ -121,7 +127,7 @@ compose hash — so we choose it. **One instance per mandate, keyed on the
 Why this shape:
 
 - The runtime lifetime mirrors the mandate's on-chain authorization. Nothing outlives
-  what it is allowed to do.
+  what it is allowed to do: it exits on fill, and on revocation.
 - Each mandate has its own key and its own gas. No cross-mandate blast radius, and
   revocation is just letting the instance die.
 - There is no redeploy in the flow — the address is read once at provisioning, signed
@@ -129,9 +135,13 @@ Why this shape:
 
 **The cost this shape carries:** a limit order waits for its trigger price, possibly for
 weeks, and the instance must survive that wait. So the risk is not redeploy stability,
-it is **restart** stability plus **idle billing** — both measured in phase 0. If the
-wait needs bounding, a `TimestampEnforcer` on the mandate gives it a deadline (same
-primitive the abandonment sweep needs, `FUTURE.md [COST]`).
+it is **restart** stability plus **idle billing**. If the wait needs bounding, a
+`TimestampEnforcer` on the mandate gives it a deadline (same primitive the abandonment
+sweep needs, `FUTURE.md [COST]`).
+
+Neither bites at demo scale: a demo order fills in minutes and Hourglass pays the
+compute. Restart stability still gets measured in phase 0 because it is cheap to check
+and expensive to discover later; idle billing is only priced, not solved.
 
 ## Trigger, not polling
 

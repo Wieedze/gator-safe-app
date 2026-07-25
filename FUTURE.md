@@ -2,6 +2,19 @@
 
 Deferred ideas captured during tasks (per workflow rules — scope discipline).
 
+- **[COST] Who pays the agent's compute.** Per `docs/AGENT_EXECUTION_PLAN.md` the agent
+  runs as a 0G Tapp instance, billed per minute. For the demo Hourglass pays it from its
+  own 0G deposit — the same call as the shared Uniswap key.
+
+  The intended end state is the operator paying for their own order's compute, but that
+  is not a config change: 0G bills by deposit into a contract **on 0G Chain**, settled in
+  EIP-712 vouchers signed by the TEE key. The operator's Safe is on Base, so charging
+  them directly means a second chain and a second token on top of the ETH gas top-up
+  they already do. Options when it matters: operator deposits on 0G directly (worst UX,
+  simplest to build), Hourglass fronts it and bills back on Base, or the cost comes out
+  of the swap. Undecided — revisit with the two-chain note in
+  `docs/0G-INTEGRATION-MAP.md §4.3`.
+
 - **[COST] Agent gas residue has no return path to the Safe.** Per ADR 0007 the agent
   wallet is funded from the Safe after the mandate is signed, and pays its own gas for
   `redeemDelegations`. Whatever it does not spend stays on an address whose key only

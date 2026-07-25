@@ -175,6 +175,37 @@ longer than indexing. No retry loop needed at the trigger.
 - Moving IPFS pinning to 0G Storage — breaks CID-based discovery
   (`docs/0G-INTEGRATION-MAP.md §2.4`).
 
+## 0G Sandbox — verified endpoints (2026-07-25)
+
+The hosted testnet broker is live; no TDX hardware of our own is needed.
+
+| | |
+|---|---|
+| Broker | `https://private-sandbox-testnet.0g.ai` |
+| Chain | 16602 (0G testnet), RPC `https://evmrpc-testnet.0g.ai` |
+| Billing contract | `0x3490B9053AC46F7Bf71A1ceBffcB2be2C1405b41` |
+| TappRegistry | `0x2Ce80374318B1d7Fb3345724457a182E0ad165c9` |
+| Provider | `0xf982279B872B9a99d64C547a0faC2Dfdfc2AEE5D` — `https://provider-private-sandbox.0g.ai` |
+
+Pricing read from `/api/providers`: create fee **0.06 0G**, then **0.001 0G per CPU per
+minute** and **0.0005 0G per GB per minute**. A 1 CPU / 1 GB sandbox costs ~0.09 0G an
+hour on top of the create fee.
+
+The faucet gives 0.1 0G per wallet per day, which does not cover one hour of sandbox —
+use the event promo code to top up before starting.
+
+Onboarding is a Claude Code plugin:
+
+```
+/plugin marketplace add 0gfoundation/0g-sandbox
+/plugin install 0g-private-sandbox@0g-sandbox
+/0g-private-sandbox
+```
+
+Note the split: the sandbox bills on 0G testnet, while the mandate it executes lives on
+Base mainnet (the HourGlass enforcers are deployed on chains 1 and 8453 only). The
+sandbox is compute — it does not care which chain the workload talks to.
+
 ## References
 
 - ADR: `.claude/choices/0007-agent-gas-is-self-funded-post-signature.md`

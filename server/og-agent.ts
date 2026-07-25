@@ -20,8 +20,8 @@
  * Run: OG_ROUTER_API_KEY=sk-... AGENT_PRIVATE_KEY=0x... UNISWAP_API_KEY=... \
  *      bun server/og-agent.ts <instruction.json>
  */
-import { readFileSync, existsSync } from 'node:fs'
-import { resolve } from 'node:path'
+import { readFileSync, writeFileSync, existsSync } from 'node:fs'
+import { resolve, join } from 'node:path'
 
 const ROUTER_URL = process.env.OG_ROUTER_URL ?? 'https://router-api.0g.ai/v1'
 const MODEL = process.env.OG_MODEL ?? '0gm-1.0-35b-a3b'
@@ -150,6 +150,11 @@ async function main(): Promise<void> {
 
   const skill = readFileSync(SKILL_PATH, 'utf8')
   const instruction = readFileSync(instructionPath, 'utf8')
+
+  // Put the instruction where the runner expects it. It is also in the prompt, and the
+  // model will happily rewrite it from there — but a mandate the model retyped is a
+  // mandate the model can mistype.
+  writeFileSync(join(resolve(WORKDIR), 'instruction.json'), instruction)
 
   const messages: Message[] = [
     { role: 'system', content: systemPrompt(skill, instruction) },

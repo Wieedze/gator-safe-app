@@ -5,6 +5,7 @@ import { useUniswapPools } from '../hooks/useUniswapPools'
 import { buildDepositPlan } from '../lib/uniswapPosition'
 import { buildYieldDelegations, buildStoredYieldPlan, type StoredYieldPlan } from '../lib/yieldDelegations'
 import { buildCompoundMandate, buildStoredCompoundDelegation, type CompoundMode, type StoredCompoundDelegation } from '../lib/compoundDelegation'
+import { checkCompoundApprovals, buildCompoundApprovalTxs } from '../lib/compoundApproval'
 import { buildDelegationTypedData } from '../lib/delegations'
 import { getEnvironment } from '../lib/environment'
 import { getAddresses } from '../config/addresses'
@@ -85,6 +86,12 @@ export default function Yield() {
   const [autoCompound, setAutoCompound] = useState(false)
   const [compoundMode, setCompoundMode] = useState<CompoundMode>('agent')
   const [compoundIntervalDays, setCompoundIntervalDays] = useState(30)
+  // null = not checked yet; [] = the Safe already has a standing approval on both
+  // tokens; non-empty = these still need the one-time approve() before the compound
+  // agent can pull harvested fees (see src/lib/compoundApproval.ts).
+  const [compoundApprovalsNeeded, setCompoundApprovalsNeeded] = useState<Address[] | null>(null)
+  const [approvingCompound, setApprovingCompound] = useState(false)
+  const [approveError, setApproveError] = useState<string | null>(null)
 
   const recommended = pools[0] ?? null
   const pool = selectedPool ?? recommended
@@ -117,6 +124,55 @@ export default function Yield() {
     }
   }, [pool, safe.chainId, safe.safeAddress])
 
+  useEffect(() => {
+    if (!pool || !autoCompound) {
+      setCompoundApprovalsNeeded(null)
+      return
+    }
+    const positionManager = UNISWAP_V3_POSITION_MANAGER[safe.chainId]
+    if (!positionManager) {
+      setCompoundApprovalsNeeded(null)
+      return
+    }
+    let cancelled = false
+    ;(async () => {
+      const chain = findChain(safe.chainId)
+      if (!chain) return
+      const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
+      const safeAddress = safe.safeAddress as Address
+      const missing = await checkCompoundApprovals(client, safeAddress, positionManager, [pool.token0.address, pool.token1.address])
+      if (!cancelled) setCompoundApprovalsNeeded(missing)
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [pool, autoCompound, safe.chainId, safe.safeAddress])
+
+  async function handleApproveCompound() {
+    if (!pool) return
+    const positionManager = UNISWAP_V3_POSITION_MANAGER[safe.chainId]
+    if (!positionManager || !compoundApprovalsNeeded || compoundApprovalsNeeded.length === 0) return
+    setApproveError(null)
+    setApprovingCompound(true)
+    try {
+      const txs = buildCompoundApprovalTxs(positionManager, compoundApprovalsNeeded)
+      await sdk.txs.send({ txs })
+      // The Safe's own multisig confirms + executes this asynchronously (it is a
+      // real transaction, not an off-chain signature) — re-check rather than
+      // assume success the moment the proposal is submitted.
+      const chain = findChain(safe.chainId)
+      if (chain) {
+        const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
+        const missing = await checkCompoundApprovals(client, safe.safeAddress as Address, positionManager, [pool.token0.address, pool.token1.address])
+        setCompoundApprovalsNeeded(missing)
+      }
+    } catch (err) {
+      setApproveError(err instanceof Error ? err.message : 'Failed to send the approval transaction')
+    } finally {
+      setApprovingCompound(false)
+    }
+  }
+
   const amount0Raw = useMemo<bigint>(() => {
     if (!pool || !amount0) return 0n
     try { return parseUnits(amount0, pool.token0.decimals) } catch { return 0n }
@@ -127,7 +183,13 @@ export default function Yield() {
   }, [pool, amount1])
   const hasBalance0 = balances ? amount0Raw <= balances.token0 : false
   const hasBalance1 = balances ? amount1Raw <= balances.token1 : false
-  const canDelegate = Boolean(pool && agentAddress && amount0Raw > 0n && amount1Raw > 0n && hasBalance0 && hasBalance1)
+  // If auto-compound is on, the standing approval must be in place first — otherwise
+  // the plan would sign fine but the compound agent would be permanently blocked
+  // the moment it tried to harvest (see checkCompoundApprovals).
+  const compoundReady = !autoCompound || compoundApprovalsNeeded?.length === 0
+  const canDelegate = Boolean(
+    pool && agentAddress && amount0Raw > 0n && amount1Raw > 0n && hasBalance0 && hasBalance1 && compoundReady,
+  )
 
   const positionValueUsd = useMemo(
     () => (pool ? estimatePositionValueUsd(pool.token0.symbol, pool.token1.symbol, amount0, amount1) : 0),
@@ -418,6 +480,30 @@ export default function Yield() {
               enabled={autoCompound}
               onToggle={setAutoCompound}
             />
+
+            {autoCompound && compoundApprovalsNeeded && compoundApprovalsNeeded.length > 0 && (
+              <div className="rounded-xl glass-soft ring-1 ring-line p-4 space-y-2">
+                <div className="flex items-center gap-2 text-sm font-medium text-ink">
+                  <IconAlert size={16} /> One-time approval needed for auto-compound
+                </div>
+                <p className="text-xs text-dim leading-relaxed">
+                  Harvesting fees pulls them back into the position via <Mono className="text-dim">increaseLiquidity</Mono>,
+                  which needs a standing approval from the Safe on{' '}
+                  {compoundApprovalsNeeded
+                    .map((t) => (t === pool.token0.address ? pool.token0.symbol : pool.token1.symbol))
+                    .join(' and ')}{' '}
+                  first — a real Safe transaction, not a delegation, so it goes through your Safe's own signers.
+                </p>
+                {approveError && (
+                  <div className="flex items-center gap-2 text-pending text-sm">
+                    <IconAlert size={16} /> {approveError}
+                  </div>
+                )}
+                <Btn kind="primary" onClick={handleApproveCompound} disabled={approvingCompound}>
+                  {approvingCompound ? 'Sending…' : 'Approve PositionManager'}
+                </Btn>
+              </div>
+            )}
 
             {planError && (
               <div className="flex items-center gap-2 text-pending text-sm">

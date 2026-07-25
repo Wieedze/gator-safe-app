@@ -82,11 +82,21 @@ interface; phase 3 picks the host.
 ## Phases
 
 **Phase 0 — validate the host (blocking, ~1 day).**
-Host is **0G Tapp** (decided 2026-07-25). Phase 0 is the check that it holds, not a
-comparison: deploy a hello-world and verify (a) `GetSecretResource` yields a usable key,
-(b) the derived address is **identical after a redeploy**, (c) `GetEvidence` returns
-attestation. (b) is the one that can kill it — the mandate is signed to that address.
-If it fails, fall back to self-hosted; phases 1–2 are unaffected either way.
+Host is **0G Tapp**, one app instance per mandate (see below). Deploy a hello-world and
+verify:
+
+- (a) `GetSecretResource` yields a usable signing key, and `GetEvidence` returns
+  attestation binding it to the deployment.
+- (b) **`stop_app` then `start_app` with the same `app_id` yields the same address.**
+  This is the one that can kill it — see below.
+- (c) What a host reboot does to a running app and its derived key. The README notes
+  *"a VM reboot clears both the state and the RTMRs"* without saying what that means for
+  the key.
+- (d) The per-minute billing rate, priced against a multi-week idle wait.
+
+Nothing here is verified yet; the address-stability reasoning is read off the README
+(HKDF from the `app_id` namespace, "hardware-independent app secrets"), not measured.
+If (b) fails, fall back to self-hosted; phases 1–2 are unaffected either way.
 
 **Phase 1 — app surface, mocked runtime.**
 Mode selector, provisioning call, fund step, balance gate, status display. Runtime
@@ -100,6 +110,28 @@ reporting. Runs locally first.
 **Phase 3 — 0G Tapp.**
 Implement the interface against Tapp (`start-app`, `GetSecretResource`, `GetEvidence`).
 Deploy. End-to-end on Base with a real mandate.
+
+## One Tapp instance per mandate
+
+`app_id` is deployer-assigned (`start_app.sh --app-id APP_ID`), not derived from the
+compose hash — so we choose it. **One instance per mandate, keyed on the
+`delegationHash`**, living exactly as long as its authorization: provisioned at
+"execute with agent", it polls, fills once (`limitedCalls(1)`), and dies.
+
+Why this shape:
+
+- The runtime lifetime mirrors the mandate's on-chain authorization. Nothing outlives
+  what it is allowed to do.
+- Each mandate has its own key and its own gas. No cross-mandate blast radius, and
+  revocation is just letting the instance die.
+- There is no redeploy in the flow — the address is read once at provisioning, signed
+  into the mandate, used once.
+
+**The cost this shape carries:** a limit order waits for its trigger price, possibly for
+weeks, and the instance must survive that wait. So the risk is not redeploy stability,
+it is **restart** stability plus **idle billing** — both measured in phase 0. If the
+wait needs bounding, a `TimestampEnforcer` on the mandate gives it a deadline (same
+primitive the abandonment sweep needs, `FUTURE.md [COST]`).
 
 ## Trigger, not polling
 

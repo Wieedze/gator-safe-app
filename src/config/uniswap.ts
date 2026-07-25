@@ -39,6 +39,15 @@ export const UNISWAP_V3_SUBGRAPH_ID: Record<number, string> = {
   [base.id]: 'FUbEPQw1oMghy39fwWBFY5fE6MXPXZQtjncQy2cXdrNS',
 }
 
+/**
+ * Permit2 — the canonical singleton at the same address on every chain. The Universal
+ * Router pulls tokens through it, so a Safe trading via the router must (one-time):
+ *   1. approve the funding token to Permit2 (ERC-20 approve, unlimited), and
+ *   2. set a Permit2 allowance for the router (Permit2.approve(token, router, amt, exp)).
+ * After that, every swap redemption just runs the router execute — no per-swap permit.
+ */
+export const PERMIT2_ADDRESS: Address = '0x000000000022D473030F116dDEE9F6B43aC78BA3'
+
 /** The three standard Uniswap v3 fee tiers, in hundredths of a bip. */
 export const FEE_TIERS = [500, 3000, 10000] as const
 

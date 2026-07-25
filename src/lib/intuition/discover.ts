@@ -41,7 +41,11 @@ const READ: Record<IntuitionNetwork, ReadConfig> = {
   },
   mainnet: {
     graphqlUrl: 'https://mainnet.intuition.sh/v1/graphql',
-    delegateTo: '0xb56980d42a3b03455bf41ea20fe04ae223fca0b9e688994dc661414e81e6433b',
+    // The mainnet "delegate to" atom differs from testnet's: the write path pins it
+    // (network.ts, termId null) and the resulting atom is this id — verified against
+    // the live graph. The testnet id 0xb569… returns zero triples on mainnet, which
+    // silently broke read-path discovery of every mainnet mandate.
+    delegateTo: '0xc587d8f586380d2252d01784a3b6b889a50f960af80cc0d8acb4dbd3e2c2c1f5',
     inContextOf: '0x892054b01d389bfe566166120470f572a56e3d4cd88c599b52c4708949625390',
   },
 }
@@ -153,6 +157,32 @@ export function findBalanceChangeCaveat(
       (c) => enforcers.includes(c.enforcer.toLowerCase()) && decodeBalanceChangeTerms(c.terms).enforceDecrease,
     ) ?? null
   )
+}
+
+/** The ERC-20 approve selector — approve(address,uint256). */
+const APPROVE_SELECTOR = '0x095ea7b3'
+
+/**
+ * The funding token an approve delegation targets — the companion of a limit-order
+ * swap. Identified by an allowedMethods caveat pinned to the approve selector; the
+ * token is its allowedTargets caveat (a single 20-byte address). Both route through
+ * the HourGlass enforcer instances (see environment.ts). Returns null if this is not
+ * an approve delegation, so the publish path can tell it apart from a strategy.
+ */
+export function findApproveTargetToken(delegation: DelegationStruct, chainId: number): Address | null {
+  const hourglass = getAddresses(chainId).hourglass
+  if (!hourglass) return null
+  const methods = hourglass.allowedMethodsEnforcer.toLowerCase()
+  const targets = hourglass.allowedTargetsEnforcer.toLowerCase()
+  const isApprove = delegation.caveats.some(
+    (c) => c.enforcer.toLowerCase() === methods && c.terms.toLowerCase().startsWith(APPROVE_SELECTOR),
+  )
+  if (!isApprove) return null
+  const target = delegation.caveats.find((c) => c.enforcer.toLowerCase() === targets)
+  // allowedTargets terms is the concatenated 20-byte target list; an approve grant
+  // has exactly one target (the funding token).
+  if (!target || (target.terms.length - 2) / 2 !== 20) return null
+  return getAddress(target.terms)
 }
 
 /**

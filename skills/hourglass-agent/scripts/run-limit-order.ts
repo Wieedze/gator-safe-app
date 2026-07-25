@@ -10,10 +10,10 @@
  *
  * Flow: discover the mandate addressed to this agent on Intuition, match the one in
  * the operator's instruction (recap JSON from the Limit order tab), poll the Uniswap
- * quote until the expected output meets the enforced min-received, then redeem
- * approve+swap atomically AS THE SAFE. The router's minimum-out is set to the same
- * min-received so a price move between quote and redeem fails the swap gracefully
- * instead of reverting the whole redeem.
+ * quote until the expected output meets the enforced min-received, then redeem the
+ * swap AS THE SAFE. The swap pulls the funding token via Permit2, so the Safe must
+ * hold a standing Permit2 allowance for the router (a one-time setup, not part of the
+ * redeem); the mandate authorises only the price-bounded swap.
  *
  * Env: AGENT_PRIVATE_KEY, UNISWAP_API_KEY, INTUITION_NETWORK (mainnet|testnet),
  *      optional RPC_URL, optional POLL_SECONDS (default 60), optional MAX_POLLS
@@ -71,7 +71,9 @@ const INTUITION: Record<'mainnet' | 'testnet', ReadConfig> = {
   },
   mainnet: {
     graphqlUrl: 'https://mainnet.intuition.sh/v1/graphql',
-    delegateTo: '0xb56980d42a3b03455bf41ea20fe04ae223fca0b9e688994dc661414e81e6433b',
+    // Mainnet "delegate to" is a distinct atom from testnet's — verified against the
+    // live graph (the testnet id 0xb569… returns zero triples on mainnet).
+    delegateTo: '0xc587d8f586380d2252d01784a3b6b889a50f960af80cc0d8acb4dbd3e2c2c1f5',
     inContextOf: '0x892054b01d389bfe566166120470f572a56e3d4cd88c599b52c4708949625390',
   },
 }
@@ -237,11 +239,6 @@ async function apiPost<T>(path: string, apiKey: string, body: unknown): Promise<
   return (await res.json()) as T
 }
 
-async function checkApproval(apiKey: string, p: { walletAddress: Address; token: Address; amount: string; chainId: number }): Promise<TradingApiTx | null> {
-  const body = await apiPost<{ approval: TradingApiTx | null }>('/check_approval', apiKey, p)
-  return body.approval ?? null
-}
-
 interface Quote { routing: string; quote: unknown; output: bigint }
 
 /** Quote EXACT_INPUT of `amount` funding → target. `output` is the expected out (raw). */
@@ -249,10 +246,12 @@ async function quoteSwap(apiKey: string, req: { swapper: Address; tokenIn: Addre
   const q = await apiPost<{ routing: string; quote: { output?: { amount?: string } } }>('/quote', apiKey, {
     swapper: req.swapper, tokenIn: req.tokenIn, tokenOut: req.tokenOut,
     tokenInChainId: String(req.chainId), tokenOutChainId: String(req.chainId),
-    amount: req.amount, type: 'EXACT_INPUT', slippageTolerance: 0.5, routingPreference: 'CLASSIC',
+    amount: req.amount, type: 'EXACT_INPUT', slippageTolerance: 0.5, routingPreference: 'BEST_PRICE',
   })
-  // A CLASSIC EXACT_INPUT quote reports the expected out under quote.output.amount
-  // (verified against the Uniswap Trading API /quote reference).
+  // routingPreference only accepts BEST_PRICE | FASTEST now (CLASSIC was deprecated as
+  // an INPUT); "CLASSIC" survives only as the response `routing` value, which the caller
+  // still checks to reject a non-redeemable UniswapX order. A CLASSIC EXACT_INPUT quote
+  // reports the expected out under quote.output.amount.
   const raw = q.quote?.output?.amount
   if (raw === undefined) throw new Error('Trading API quote: no output amount in response')
   return { routing: q.routing, quote: q.quote, output: BigInt(raw) }
@@ -275,19 +274,20 @@ function toSdkDelegation(d: DelegationStruct): Delegation {
 
 async function fillOrder(params: {
   walletClient: WalletClient; publicClient: PublicClient; apiKey: string
-  order: DiscoveredOrder; safe: Address; quote: unknown; chainId: number
+  order: DiscoveredOrder; quote: unknown
 }): Promise<Hex> {
-  const { walletClient, publicClient, apiKey, order, safe, quote, chainId } = params
+  const { walletClient, publicClient, apiKey, order, quote } = params
   const delegation = toSdkDelegation(order.delegation)
 
-  const approval = await checkApproval(apiKey, { walletAddress: safe, token: order.fundingToken, amount: order.maxSpend.toString(), chainId })
+  // The swap pulls the funding token through Permit2 (Universal Router 2.0), which
+  // requires a standing Permit2 allowance for the router on the Safe — a one-time
+  // setup, NOT part of this redeem. So the mandate authorises the swap alone: a
+  // single execution, a single redemption (compatible with limitedCalls(1)). The
+  // Increase bound wraps the swap that delivers the bought token, so it nets true.
   const swap = await buildSwapTx(apiKey, quote)
-
-  const redemptions: Redemption[] = []
-  if (approval) {
-    redemptions.push({ permissionContext: [delegation], executions: [createExecution({ target: approval.to, value: 0n, callData: approval.data })], mode: ExecutionMode.SingleDefault })
-  }
-  redemptions.push({ permissionContext: [delegation], executions: [createExecution({ target: swap.to, value: BigInt(swap.value), callData: swap.data })], mode: ExecutionMode.SingleDefault })
+  const redemptions: Redemption[] = [
+    { permissionContext: [delegation], executions: [createExecution({ target: swap.to, value: BigInt(swap.value), callData: swap.data })], mode: ExecutionMode.SingleDefault },
+  ]
 
   // The helper simulates before sending — a min-received / cap revert surfaces here.
   return redeemDelegations(walletClient, publicClient, DELEGATION_MANAGER, redemptions)
@@ -360,7 +360,7 @@ async function main() {
     } else if (quote.output >= order.minReceived) {
       console.log(`  dip hit: quote returns ${formatUnits(quote.output, outDecimals)} ≥ ${formatUnits(order.minReceived, outDecimals)} — filling`)
       try {
-        const hash = await fillOrder({ walletClient, publicClient, apiKey, order, safe: instruction.safe, quote: quote.quote, chainId })
+        const hash = await fillOrder({ walletClient, publicClient, apiKey, order, quote: quote.quote })
         console.log('  redeemed:', hash)
         const receipt = await publicClient.waitForTransactionReceipt({ hash })
         console.log('  status:', receipt.status, 'block', receipt.blockNumber)

@@ -4,20 +4,21 @@ import type { DelegationStruct } from './delegations'
 import type { Caveat } from './storage'
 
 /**
- * Build a limit-order mandate: one delegation the Safe signs once, letting an
- * agent make a SINGLE swap that only clears at or below a target price — a
- * non-custodial buy-the-dip. Everything is enforced on-chain:
+ * Build a limit-order mandate: one delegation the Safe signs once, letting an agent
+ * make a SINGLE buy-the-dip swap that only clears at or below a target price —
+ * non-custodial, everything enforced on-chain:
  *
- *   - `functionCall` scope → approve on the funding token + execute on the router.
+ *   - `functionCall` scope → execute on the Universal Router.
  *   - `erc20BalanceChange` Decrease on the funding token → the max spent.
- *   - `erc20BalanceChange` Increase on the bought token → the min received. Since a
- *     lower price returns MORE of the bought token, requiring a minimum received is
- *     equivalent to "only if the price is at or below the trigger": the swap reverts
- *     when the token is too expensive, clears when it's cheap enough.
+ *   - `erc20BalanceChange` Increase on the bought token → the min received. A lower
+ *     price returns MORE of the bought token, so a minimum received is equivalent to
+ *     "only if the price is at or below the trigger".
  *   - `limitedCalls(1)` → the order fires exactly once.
  *
- * The agent watches the price off-chain and redeems when the dip hits; the caveats
- * guarantee it can only spend up to the cap, only at/below the price, only once.
+ * The swap pulls the funding token through Permit2 (Universal Router 2.0), so the
+ * Safe must have a standing Permit2 allowance for the router — a one-time setup per
+ * Safe, independent of any single order (see the Permit2 setup flow). The delegation
+ * itself only authorises the price-bounded swap.
  */
 
 export interface LimitOrderParams {
@@ -35,13 +36,13 @@ export interface LimitOrderParams {
   fundingToken: Address
   /** The token bought (e.g. WETH). */
   targetToken: Address
-  /** Max spend, raw units of the funding token. */
+  /** Max spend, raw units of the funding token — the Decrease cap. */
   maxSpend: bigint
   /** Min received, raw units of the target token — the price trigger. */
   minReceived: bigint
 }
 
-const SELECTORS = ['approve(address,uint256)', 'execute(bytes,bytes[],uint256)'] as const
+const SWAP_SELECTOR = 'execute(bytes,bytes[],uint256)'
 
 /** salt = keccak256(terms) (project convention; never '0x' — computeDelegationHash does BigInt(salt)). */
 function orderSalt(p: LimitOrderParams): Hex {
@@ -63,11 +64,11 @@ export function buildLimitOrderMandate(p: LimitOrderParams): DelegationStruct {
     environment: p.environment as never,
     scope: {
       type: 'functionCall',
-      targets: [p.swapRouter, p.fundingToken, p.targetToken],
-      selectors: SELECTORS,
+      targets: [p.swapRouter],
+      selectors: [SWAP_SELECTOR],
     } as never,
     caveats: [
-      // Max spent — the anti-drain cap.
+      // Max spent — the anti-drain cap (measured on the Safe, which spends).
       { type: 'erc20BalanceChange', tokenAddress: p.fundingToken, recipient: p.recipient, balance: p.maxSpend, changeType: BalanceChangeType.Decrease },
       // Min received — the price trigger (only clears at/below the target price).
       { type: 'erc20BalanceChange', tokenAddress: p.targetToken, recipient: p.recipient, balance: p.minReceived, changeType: BalanceChangeType.Increase },

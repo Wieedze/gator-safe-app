@@ -19,6 +19,7 @@ import { poolValueShare, type PoolInfo } from '../lib/uniswapDiscovery'
 type YieldPlanWithCompound = StoredYieldPlan & { compound?: StoredCompoundDelegation }
 import { Card, Btn, Mono, CopyChip } from '../ui/components'
 import { Block, Field } from '../ui/form'
+import { dec } from '../lib/numeric-input'
 import { CompoundProjection } from '../ui/CompoundProjection'
 import { IconTrend, IconAlert, IconCheck } from '../ui/icons'
 
@@ -374,8 +375,9 @@ export default function Yield() {
             <div className="grid grid-cols-2 gap-4">
               <Field label={`${pool.token0.symbol} amount`} required missing={amount0Raw > 0n && !hasBalance0}>
                 <input
+                  type="text" inputMode="decimal"
                   value={amount0}
-                  onChange={(e) => setAmount0(e.target.value)}
+                  onChange={(e) => setAmount0(dec(e.target.value))}
                   placeholder="0.00"
                   aria-label={`${pool.token0.symbol} amount`}
                   className={`font-mono ${amount0Raw > 0n && !hasBalance0 ? 'ring-1 ring-danger' : ''}`}
@@ -388,8 +390,9 @@ export default function Yield() {
               </Field>
               <Field label={`${pool.token1.symbol} amount`} required missing={amount1Raw > 0n && !hasBalance1}>
                 <input
+                  type="text" inputMode="decimal"
                   value={amount1}
-                  onChange={(e) => setAmount1(e.target.value)}
+                  onChange={(e) => setAmount1(dec(e.target.value))}
                   placeholder="0.00"
                   aria-label={`${pool.token1.symbol} amount`}
                   className={`font-mono ${amount1Raw > 0n && !hasBalance1 ? 'ring-1 ring-danger' : ''}`}

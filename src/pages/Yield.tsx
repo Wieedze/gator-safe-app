@@ -18,8 +18,9 @@ import { poolValueShare, type PoolInfo } from '../lib/uniswapDiscovery'
 /** The signed yield plan, optionally carrying the auto-compound mandate (with its
  * salt-verifiable terms, so the agent needs no out-of-band interval config). */
 type YieldPlanWithCompound = StoredYieldPlan & { compound?: StoredCompoundDelegation }
+import { buildYieldRedeemTxs } from '../lib/redeemYield'
 import { Card, Btn, Mono, CopyChip } from '../ui/components'
-import { Block, Field } from '../ui/form'
+import { Block, Field, Segmented } from '../ui/form'
 import { dec } from '../lib/numeric-input'
 import { CompoundProjection } from '../ui/CompoundProjection'
 import { IconTrend, IconAlert, IconCheck } from '../ui/icons'
@@ -92,6 +93,12 @@ export default function Yield() {
   const [compoundApprovalsNeeded, setCompoundApprovalsNeeded] = useState<Address[] | null>(null)
   const [approvingCompound, setApprovingCompound] = useState(false)
   const [approveError, setApproveError] = useState<string | null>(null)
+  // Who redeems: 'agent' delegates to an external agent wallet (a bot runs it);
+  // 'manual' makes the Safe itself the delegate, so the operator redeems from the
+  // Safe App (no bot, no key handoff). The choice sets the delegate at signing time.
+  const [redeemMode, setRedeemMode] = useState<'agent' | 'manual'>('agent')
+  const [redeeming, setRedeeming] = useState(false)
+  const [redeemDone, setRedeemDone] = useState(false)
 
   const recommended = pools[0] ?? null
   const pool = selectedPool ?? recommended
@@ -100,6 +107,11 @@ export default function Yield() {
   const [agent, setAgent] = useState(() => (import.meta.env.VITE_YIELD_AGENT_ADDRESS as string | undefined) ?? '')
   const agentValid = isAddress(agent)
   const agentAddress = agentValid ? (agent as Address) : undefined
+  const safeAddress = safe.safeAddress as Address
+  // The delegate the plan is signed to: an external agent (Agent mode) or the Safe
+  // itself (Manual mode, so the operator can redeem it from the Safe App).
+  const delegateAddress: Address | undefined = redeemMode === 'manual' ? safeAddress : agentAddress
+  const delegateReady = redeemMode === 'manual' || agentValid
 
   useEffect(() => {
     if (!pool) {
@@ -111,8 +123,6 @@ export default function Yield() {
         const chain = findChain(safe.chainId)
         if (!chain) return
         const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
-        // safe.safeAddress from the Safe Apps SDK is typed as a plain string, not viem's Address.
-        const safeAddress = safe.safeAddress as Address
         const [token0, token1] = await Promise.all([
           client.readContract({ address: pool.token0.address, abi: erc20Abi, functionName: 'balanceOf', args: [safeAddress] }),
           client.readContract({ address: pool.token1.address, abi: erc20Abi, functionName: 'balanceOf', args: [safeAddress] }),
@@ -122,7 +132,7 @@ export default function Yield() {
     return () => {
       cancelled = true
     }
-  }, [pool, safe.chainId, safe.safeAddress])
+  }, [pool, safe.chainId, safe.safeAddress, safeAddress])
 
   useEffect(() => {
     if (!pool || !autoCompound) {
@@ -188,7 +198,7 @@ export default function Yield() {
   // the moment it tried to harvest (see checkCompoundApprovals).
   const compoundReady = !autoCompound || compoundApprovalsNeeded?.length === 0
   const canDelegate = Boolean(
-    pool && agentAddress && amount0Raw > 0n && amount1Raw > 0n && hasBalance0 && hasBalance1 && compoundReady,
+    pool && delegateAddress && amount0Raw > 0n && amount1Raw > 0n && hasBalance0 && hasBalance1 && compoundReady,
   )
 
   const positionValueUsd = useMemo(
@@ -199,17 +209,16 @@ export default function Yield() {
   const aprIsEstimate = pool?.apy == null
 
   async function handleDelegate() {
-    if (!pool || !agentAddress) return
+    if (!pool || !delegateAddress) return
     setPlanError(null)
     setStoredPlan(null)
+    setRedeemDone(false)
     setStep('preparing')
     try {
       const chain = findChain(safe.chainId)
       if (!chain) throw new Error(`Unsupported chain: ${safe.chainId}`)
       const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
       const addrs = getAddresses(safe.chainId)
-      // safe.safeAddress from the Safe Apps SDK is typed as a plain string, not viem's Address.
-      const safeAddress = safe.safeAddress as Address
       // readContract's return type is generic over the ABI; predictAddress's single
       // output is known (from DeleGatorModuleFactoryABI) to be an address.
       const moduleAddress = (await client.readContract({
@@ -232,7 +241,7 @@ export default function Yield() {
       const yieldDelegations = buildYieldDelegations({
         plan,
         moduleAddress,
-        agentAddress,
+        agentAddress: delegateAddress,
         environment,
         deadlineSeconds: DEADLINE_SECONDS,
       })
@@ -263,7 +272,7 @@ export default function Yield() {
         chainId: safe.chainId,
         safeAddress,
         moduleAddress,
-        agentAddress,
+        agentAddress: delegateAddress,
       })
 
       // If the operator enabled auto-compound, sign one more standing delegation —
@@ -274,7 +283,7 @@ export default function Yield() {
         if (!positionManager) throw new Error(`Uniswap PositionManager not configured for chain ${safe.chainId}`)
         const mandate = buildCompoundMandate({
           chainId: safe.chainId,
-          agentAddress,
+          agentAddress: delegateAddress,
           moduleAddress,
           safeAddress,
           positionManager,
@@ -314,6 +323,24 @@ export default function Yield() {
     a.download = `yield-plan-${storedPlan.pool.address.slice(2, 8)}.json`
     a.click()
     URL.revokeObjectURL(url)
+  }
+
+  // Manual redeem: send the signed deposit delegations from the Safe App as one
+  // batched Safe tx (the Safe is the delegate). Same redeemDelegations a bot would
+  // send — the caveats still bound each call.
+  async function handleRedeem() {
+    if (!storedPlan) return
+    setPlanError(null)
+    setRedeeming(true)
+    try {
+      const txs = buildYieldRedeemTxs(storedPlan.chainId, storedPlan.delegations)
+      await sdk.txs.send({ txs })
+      setRedeemDone(true)
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Failed to redeem the deposit')
+    } finally {
+      setRedeeming(false)
+    }
   }
 
   return (
@@ -411,29 +438,50 @@ export default function Yield() {
       )}
 
       {pool && (
-        <Block title="Delegate to agent">
+        <Block title="Delegate">
           <p className="text-xs text-dim -mt-1 leading-relaxed">
             Signs 3 single-use delegations — approve {pool.token0.symbol}, approve {pool.token1.symbol}, mint a full-range
-            position — each pinned to an exact, pre-built transaction. The agent wallet redeems them itself; it cannot
-            change the target, method, amount, or recipient.
+            position — each pinned to an exact, pre-built transaction. The delegate redeems them; it cannot change the
+            target, method, amount, or recipient.
           </p>
 
-          <Field label="Agent address" required missing={agent !== '' && !agentValid}>
-            <input
-              type="text" placeholder="0x…" value={agent}
-              onChange={(e) => setAgent(e.target.value)}
-              aria-label="Agent address"
-              className={`font-mono ${agent && !agentValid ? 'ring-1 ring-danger' : ''}`}
+          <div className="flex items-center gap-3 flex-wrap">
+            <span className="text-[11px] text-faint">Redeemed by</span>
+            <Segmented
+              options={[
+                { key: 'agent', label: 'Agent' },
+                { key: 'manual', label: 'Manual' },
+              ]}
+              value={redeemMode}
+              onChange={setRedeemMode}
             />
-          </Field>
-          {!agentValid && (
-            <p className="text-xs text-faint -mt-2">
-              Run the agent yourself (see scripts/yield-agent.ts) and paste its wallet address here — everything below
-              stays locked until you do.
+          </div>
+
+          {redeemMode === 'agent' ? (
+            <>
+              <Field label="Agent address" required missing={agent !== '' && !agentValid}>
+                <input
+                  type="text" placeholder="0x…" value={agent}
+                  onChange={(e) => setAgent(e.target.value)}
+                  aria-label="Agent address"
+                  className={`font-mono ${agent && !agentValid ? 'ring-1 ring-danger' : ''}`}
+                />
+              </Field>
+              {!agentValid && (
+                <p className="text-xs text-faint -mt-2">
+                  Run the agent yourself (see scripts/yield-agent.ts) and paste its wallet address here — everything below
+                  stays locked until you do.
+                </p>
+              )}
+            </>
+          ) : (
+            <p className="text-xs text-faint">
+              Manual mode: this Safe is the delegate. After signing, you redeem the deposit yourself from the Safe App —
+              no agent wallet, no key handoff.
             </p>
           )}
 
-          <div className={agentValid ? 'space-y-4' : 'space-y-4 opacity-40 pointer-events-none select-none'} aria-disabled={!agentValid}>
+          <div className={delegateReady ? 'space-y-4' : 'space-y-4 opacity-40 pointer-events-none select-none'} aria-disabled={!delegateReady}>
             <div className="grid grid-cols-2 gap-4">
               <Field label={`${pool.token0.symbol} amount`} required missing={amount0Raw > 0n && !hasBalance0}>
                 <input
@@ -514,17 +562,38 @@ export default function Yield() {
             {step === 'done' && storedPlan ? (
               <div className="rounded-xl glass-soft ring-1 ring-line p-4 space-y-3">
                 <div className="flex items-center gap-2 text-sm font-medium text-active">
-                  <IconCheck size={16} /> Plan signed — {storedPlan.compound ? '3 delegations + auto-compound' : '3 delegations'} ready for the agent.
+                  <IconCheck size={16} /> Plan signed — {storedPlan.compound ? '3 delegations + auto-compound' : '3 delegations'}
+                  {redeemMode === 'manual' ? ' — redeem it below.' : ' ready for the agent.'}
                 </div>
                 <div className="text-xs text-dim">
-                  Agent wallet: <Mono>{short(storedPlan.agentAddress)}</Mono>
+                  {redeemMode === 'manual' ? (
+                    <>Redeemer: <Mono>this Safe</Mono></>
+                  ) : (
+                    <>Agent wallet: <Mono>{short(storedPlan.agentAddress)}</Mono></>
+                  )}
                 </div>
-                <div className="flex items-center gap-2">
-                  <Btn kind="primary" onClick={downloadPlan}>
-                    Download plan.json
-                  </Btn>
-                  <CopyChip value={JSON.stringify(storedPlan)} label="Copy plan JSON" />
-                </div>
+
+                {redeemMode === 'manual' ? (
+                  redeemDone ? (
+                    <div className="flex items-center gap-2 text-sm font-medium text-active">
+                      <IconCheck size={16} /> Deposit redeemed — position minted to the Safe.
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-2">
+                      <Btn kind="primary" onClick={handleRedeem} disabled={redeeming}>
+                        {redeeming ? 'Redeeming…' : 'Redeem deposit'}
+                      </Btn>
+                      <CopyChip value={JSON.stringify(storedPlan)} label="Copy plan JSON" />
+                    </div>
+                  )
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <Btn kind="primary" onClick={downloadPlan}>
+                      Download plan.json
+                    </Btn>
+                    <CopyChip value={JSON.stringify(storedPlan)} label="Copy plan JSON" />
+                  </div>
+                )}
               </div>
             ) : (
               <Btn kind="primary" size="lg" onClick={handleDelegate} disabled={!canDelegate || step !== 'idle'}>

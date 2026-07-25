@@ -4,6 +4,16 @@ Document de référence. Où chaque brique 0G se branche (ou ne se branche pas) 
 couche agentique actuelle de Hourglass. Aucune décision prise ici — c'est l'état des
 lieux pour arbitrer.
 
+> **Révisé le 2026-07-26 — lire l'ADR 0008 d'abord.** La première version de ce document
+> présentait 0G Tapp comme la plateforme d'hébergement de l'agent. C'était tiré de
+> résumés automatiques de README, pas de sources primaires. Vérification faite : **aucun
+> produit 0G n'héberge d'application.** Les sections 2.1 et 2.2, le tableau de
+> correspondance §3 et les points ouverts §4 ont été corrigés.
+>
+> Règle de méthode qui en découle : sur 0G, la source est `docs.0g.ai/llms-full.txt` et
+> `docs.0g.ai/ai-context.md` en markdown brut, ou le dépôt lu directement. Un résumé est
+> une piste, pas une preuve.
+
 Voir [doc-0G.md](doc-0G.md) pour la doc 0G brute (paramètres réseau, SDK, prix, erreurs de doc relevées).
 
 ---
@@ -40,54 +50,48 @@ et la persistance du process.**
 
 ## 2. Ce que 0G apporte, brique par brique
 
-### 2.1 0G Tapp — le vrai point de branchement
+### 2.1 0G Tapp — pas un point de branchement
 
-Repo : `github.com/0gfoundation/0g-tapp` (Rust). « Trusted Application Platform »,
-déploiement d'applications dans des enclaves TEE (TDX / SEV / SGX).
+> **Corrigé le 2026-07-26 (ADR 0008).** La version précédente de cette section décrivait
+> Tapp comme une plateforme d'hébergement d'applications, avec `GetSecretResource`,
+> `GetEvidence` et une adresse dérivée stable. C'était tiré d'un résumé automatique du
+> README, relayé comme du fait. Vérification faite, c'est faux.
 
-Trois primitives qui correspondent exactement aux deux frictions ci-dessus :
+Mesuré sur le corpus documentaire complet (`docs.0g.ai/llms-full.txt`, 603 Ko, récupéré
+le 2026-07-26) : **`tapp` = 2 occurrences**, toutes deux dans la section *inference
+provider*, sous « TEE Node Setup », avec pour prérequis **NVIDIA H100 ou H200 avec
+support TEE**, et Dstack ou 0G-TAPP comme deux manières de monter ce nœud.
 
-| Primitive Tapp | Ce que ça résout côté Hourglass |
-|---|---|
-| Déploiement par **Docker Compose** (`start-app`), mesuré et étendu au runtime event log | le runner `run-limit-order.ts` tourne en continu, hors du laptop de l'opérateur |
-| **`GetSecretResource`** — secrets dérivés du KMS, déchiffrés localement dans le TEE | `AGENT_PRIVATE_KEY` et `UNISWAP_API_KEY` n'existent plus en clair hors de l'enclave |
-| **`GetEvidence`** — attestation liant l'**adresse Ethereum dérivée du TEE** aux mesures du runtime | l'adresse agent que l'opérateur colle dans le Safe App devient *prouvablement* celle d'un binaire mesuré |
+**Tapp est l'outillage pour devenir provider GPU d'inférence sur 0G Compute.** Ce n'est
+pas une plateforme de déploiement d'applications, et 0G n'en publie aucune.
 
-Modèle de sécurité annoncé : **« Malicious Deployer »** — même le déployeur ne peut pas
-compromettre l'application.
+Corroboré par trois surfaces officielles indépendantes :
 
-**Conséquence directe sur le trust model de Hourglass.** Aujourd'hui le SKILL dit :
-« Even a buggy or compromised agent cannot spend more than the cap ». C'est la borne
-*basse*. Avec Tapp, on peut ajouter une borne *haute* : l'opérateur peut vérifier
-**quel code** tourne derrière l'adresse agent, avant de signer le mandat. La borne
-on-chain reste le filet de sécurité ; l'attestation devient l'argument commercial.
+| Surface | `tapp` | `sandbox` |
+|---|---|---|
+| `docs.0g.ai/llms-full.txt` | 2 (section provider) | **0** |
+| `0gfoundation/0g-agent-skills` (14 guides + 6 patterns) | **0** | **0** |
+| `build.0g.ai/zero-coding` | **0** | **0** |
 
-**Ce qui reste manuel même avec Tapp :** financer l'adresse agent en gas (la chaîne
-d'exécution reste Base/Ethereum), et signer le mandat dans le Safe. Ces deux-là sont
-irréductibles.
+Ce que la page Zero Coding propose réellement : `ai-context` / `llms.txt`, les deux repos
+de skills, et le serveur MCP `@0gfoundation/0g-cc`. Rien pour héberger un agent.
 
-API : gRPC (`StartApp`, `StopApp`, `GetEvidence`, `GetSecretResource`, `ListApps`),
-contrôle d'accès par signature EVM.
+### 2.2 0G Sandbox — live, mais hors documentation
 
-### 2.2 0G Sandbox — la couche produit au-dessus de Tapp
+Repo : `github.com/0gfoundation/0g-sandbox` (Go). Sandboxes privés pour « vibe coding »,
+bâtis sur Tapp + Daytona.
 
-Repo : `github.com/0gfoundation/0g-sandbox` (Go). « Private, isolated sandboxes for
-vibe coding ». = **0G Tapp (TEE) + Daytona (runtime de sandbox)**, avec un proxy de
-facturation qui tourne lui-même dans une enclave TDX.
+**Ce qui est vérifié par requête directe** (pas par résumé) : le broker testnet répond,
+et renvoie chain 16602, un contrat de facturation, un `TappRegistry`, et un provider
+enregistré avec ses prix. Voir le tableau d'endpoints dans
+`AGENT_EXECUTION_PLAN.md`. C'est réel.
 
-- Auth par **signature wallet**, l'utilisateur doit acquitter l'app ID du provider dans `TappRegistry`
-- Facturation **à la minute**, règlement on-chain via **vouchers EIP-712 signés par la clé TEE**, dépôt dans un contrat Solidity
-- Claim : « the provider never sees the user's code »
-- Endpoints : `GET /api/info` (contrat, RPC, chainId, broker app ID), `GET /api/providers`, `GET /api/sandbox_list`, `/proxy/:provider/*`
-- Intégration Claude documentée : `/0g-private-sandbox`
+**Ce qui n'est pas vérifié** : tout le reste — dérivation de clé, stabilité d'adresse,
+garanties de confidentialité. Ça vient des README.
 
-Lecture pour Hourglass : c'est le chemin le moins coûteux pour tester l'idée « le runner
-tourne ailleurs, en confidentiel » sans écrire de gRPC Tapp. Le modèle de paiement
-(dépôt + vouchers EIP-712) est structurellement le même vocabulaire que le mandat
-Hourglass — signature hors-chaîne, règlement borné, pas d'intermédiaire de confiance.
-
-⚠️ Non documenté sur `docs.0g.ai` (rien dans le sitemap). Toute l'info vient des README
-GitHub. Statut de maturité inconnu.
+⚠️ Zéro occurrence dans la doc officielle, dans les deux repos de skills, et sur la page
+Zero Coding. C'est un produit annexe, non documenté et sans garantie de stabilité.
+Candidat testable pour héberger le runner, pas une décision.
 
 ### 2.3 0G Compute (Router) — utile seulement si on ajoute une couche de décision
 
@@ -156,7 +160,8 @@ dit qui est cet agent, ce qu'il fait, ni s'il est le même que la dernière fois
 - Code : `github.com/0gfoundation/0g-agent-nft` (branche `eip-7857-draft`)
 - ⚠️ Aucune adresse de contrat déployée dans la doc
 
-Combiné avec `GetEvidence` de Tapp, ça donne la chaîne complète :
+~~Combiné avec `GetEvidence` de Tapp~~ — retiré (ADR 0008), Tapp n'atteste pas une app
+arbitraire. Reste, sans attestation :
 `identité ERC-8004` → `attestation TEE` → `adresse agent` → `mandat signé par le Safe`.
 
 ### 2.6 0G Chain — hors sujet ici
@@ -179,9 +184,9 @@ de router Uniswap. Hors scope, sauf décision produit explicite.
 
 | Friction actuelle | Brique 0G | Maturité de la doc |
 |---|---|---|
-| La clé agent vit dans un `.env` sur un laptop | **0G Tapp** `GetSecretResource` + signer dérivé du TEE | README GitHub uniquement |
-| Le process meurt à la fin de la session | **0G Tapp** `start-app` / **0G Sandbox** | README GitHub uniquement |
-| L'opérateur ne peut pas vérifier le code derrière l'adresse | **0G Tapp** `GetEvidence` (attestation) | README GitHub uniquement |
+| La clé agent vit dans un `.env` sur un laptop | **rien chez 0G** — candidat : 0G Sandbox (non documenté) | ADR 0008 |
+| Le process meurt à la fin de la session | **rien chez 0G** — candidat : 0G Sandbox, ou auto-hébergé | ADR 0008 |
+| L'opérateur ne peut pas vérifier le code derrière l'adresse | **non résolu** — aucune attestation disponible | ADR 0008 |
 | L'adresse agent est anonyme | **Agentic ID** ERC-8004 | doc 0G, pas d'adresse déployée |
 | Pas de couche de décision en langage naturel | **0G Compute Router** | doc complète, API live vérifiée |
 | Financer le gas de l'agent | — | irréductible |
@@ -191,11 +196,11 @@ de router Uniswap. Hors scope, sauf décision produit explicite.
 
 ## 4. Points ouverts à trancher
 
-1. **Le gas de l'agent dans une enclave.** Si la clé est dérivée par le KMS du TEE,
-   l'adresse change-t-elle entre deux déploiements (donc entre deux mesures de runtime) ?
-   Si oui, chaque redéploiement invalide le mandat signé — l'opérateur devrait re-signer.
-   C'est le risque n°1 de l'approche Tapp. À vérifier dans `0g-tapp` avant tout prototype.
-2. **Maturité.** Tapp et Sandbox sont **absents de `docs.0g.ai`** (85 pages au sitemap,
+1. **Où tourne l'agent.** Question rouverte par l'ADR 0008 : aucun produit 0G n'héberge
+   d'application. Restent 0G Sandbox (live mais non documenté) et l'auto-hébergement (qui
+   fait que Hourglass détient la clé agent). Quel que soit l'hôte, il doit garder la même
+   adresse à travers un redémarrage — le mandat est signé vers elle.
+2. **Maturité.** Sandbox est **absent de `docs.0g.ai`** (85 pages au sitemap,
    aucune ne les mentionne). Toute l'info vient des README. Contraste net avec le Router,
    documenté et vérifié live.
 3. **Chaîne de règlement.** Sandbox facture à la minute sur 0G Chain ; les mandats

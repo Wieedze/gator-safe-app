@@ -80,29 +80,27 @@ start(runtimeRef, instruction): Promise<void>
 status(runtimeRef): Promise<AgentState>
 ```
 
-`0G Tapp` and `self-hosted` are two implementations. Phases 1–2 build against the
-interface; phase 3 picks the host.
+**The host is undecided** (ADR 0008). Two candidates implement this interface —
+0G Sandbox and self-hosted. Phases 1–2 build against the interface and are unaffected by
+which wins.
 
 ## Phases
 
-**Phase 0 — validate the host (blocking, ~1 day).**
-Host is **0G Tapp**, one app instance per mandate (see below). Deploy a hello-world and
-verify:
+**Phase 0 — find a host (blocking).**
+Per ADR 0008, **0G publishes no product for hosting an agent.** Tapp is the tooling to
+become a GPU inference provider (H100/H200 hardware), not an application platform, and
+the earlier plan built on it is withdrawn. Two candidates remain:
 
-- (a) `GetSecretResource` yields a usable signing key, and `GetEvidence` returns
-  attestation binding it to the deployment.
-- (b) **`stop_app` then `start_app` with the same `app_id` yields the same address.**
-  This is the one that can kill it — see below.
-- (c) What a host reboot does to a running app and its derived key. The README notes
-  *"a VM reboot clears both the state and the RTMRs"* without saying what that means for
-  the key.
-- (d) The per-minute billing rate. **Informational only for the demo** — Hourglass pays
-  the compute from its own 0G deposit, and a demo order fills in minutes. Priced here
-  just so the multi-week idle case is a known number, not a surprise later.
+- **0G Sandbox** — live and reachable (endpoints below, curled not summarised), but
+  absent from every official surface: 0 mentions in the docs corpus, in `0g-agent-skills`,
+  in `0g-compute-skills`, or on `build.0g.ai/zero-coding`. Test whether a long-lived
+  process can run in it, hold a key, and survive a restart.
+- **Self-hosted** — Hourglass runs the process. Works today, but Hourglass then holds the
+  agent key.
 
-Nothing here is verified yet; the address-stability reasoning is read off the README
-(HKDF from the `app_id` namespace, "hardware-independent app secrets"), not measured.
-If (b) fails, fall back to self-hosted; phases 1–2 are unaffected either way.
+What phase 0 has to answer, for whichever candidate: can the runtime hold a signing key
+the operator never sees, keep the **same address** across a restart (the mandate is
+signed to it), and stay alive while a limit order waits for its price.
 
 **Phase 1 — app surface, mocked runtime.**
 Mode selector, provisioning call, fund step, balance gate, status display. Runtime
@@ -110,19 +108,18 @@ interface backed by a stub returning a local throwaway address. Ships and demos 
 any host decision.
 
 **Phase 2 — runtime process.**
-Package `run-limit-order.ts` as a long-lived service against the interface. Status
-reporting. Runs locally first.
+Package `run-limit-order.ts` as a long-lived service against the interface. Runs locally
+first.
 
-**Phase 3 — 0G Tapp.**
-Implement the interface against Tapp (`start-app`, `GetSecretResource`, `GetEvidence`).
-Deploy. End-to-end on Base with a real mandate.
+**Phase 3 — host integration.**
+Implement the interface for whichever host phase 0 selects. Deploy. End-to-end on Base
+with a real mandate.
 
-## One Tapp instance per mandate
+## One runtime instance per mandate
 
-`app_id` is deployer-assigned (`start_app.sh --app-id APP_ID`), not derived from the
-compose hash — so we choose it. **One instance per mandate, keyed on the
-`delegationHash`**, living exactly as long as its authorization: provisioned at
-"execute with agent", it polls, fills once (`limitedCalls(1)`), and dies.
+Host-independent shape. **One instance per mandate, keyed on the `delegationHash`**,
+living exactly as long as its authorization: provisioned at "execute with agent", it
+polls, fills once (`limitedCalls(1)`), and dies.
 
 Why this shape:
 
@@ -130,18 +127,16 @@ Why this shape:
   what it is allowed to do: it exits on fill, and on revocation.
 - Each mandate has its own key and its own gas. No cross-mandate blast radius, and
   revocation is just letting the instance die.
-- There is no redeploy in the flow — the address is read once at provisioning, signed
-  into the mandate, used once.
+- The address is read once at provisioning, signed into the mandate, used once.
 
 **The cost this shape carries:** a limit order waits for its trigger price, possibly for
-weeks, and the instance must survive that wait. So the risk is not redeploy stability,
-it is **restart** stability plus **idle billing**. If the wait needs bounding, a
+weeks, and the instance must survive that wait — so **restart stability** and **idle
+cost** are properties the host must have, whichever it is. If the wait needs bounding, a
 `TimestampEnforcer` on the mandate gives it a deadline (same primitive the abandonment
 sweep needs, `FUTURE.md [COST]`).
 
-Neither bites at demo scale: a demo order fills in minutes and Hourglass pays the
-compute. Restart stability still gets measured in phase 0 because it is cheap to check
-and expensive to discover later; idle billing is only priced, not solved.
+Neither bites at demo scale: a demo order fills in minutes. Restart stability still gets
+measured in phase 0 — cheap to check, expensive to discover later.
 
 ## Trigger, not polling
 
@@ -157,11 +152,11 @@ longer than indexing. No retry loop needed at the trigger.
 
 **Blocking phase 3:**
 
-- **Tapp address stability** — phase 0 verifies it. If the derived address changes on
-  redeploy, the host falls back to self-hosted, and Hourglass then holds the agent key
-  — contradicting *"Hourglass never holds your keys"* in
-  `skills/hourglass-agent/SKILL.md`. That contradiction needs its own ADR before
-  shipping. It does not arise under Tapp.
+- **The host itself** (ADR 0008). No 0G product hosts agents. If phase 0 lands on
+  self-hosted, Hourglass holds the agent key — contradicting *"Hourglass never holds your
+  keys and never runs the agent for you"* in `skills/hourglass-agent/SKILL.md`. That
+  contradiction needs its own decision before shipping, and it also removes any claim
+  that the agent runs in a TEE.
 
 **Non-blocking:**
 
@@ -175,9 +170,23 @@ longer than indexing. No retry loop needed at the trigger.
 - Moving IPFS pinning to 0G Storage — breaks CID-based discovery
   (`docs/0G-INTEGRATION-MAP.md §2.4`).
 
+## What 0G actually offers
+
+Verified against primary sources (ADR 0008). Two separate things, do not conflate them:
+
+**Supported and live — services you call.** 0G Compute (router at
+`https://router-api.0g.ai/v1`, 23 models, OpenAI- and Anthropic-compatible, catalogue
+read directly), 0G Storage, 0G Chain, 0G DA. The official builder toolkit is the
+`ai-context` / `llms.txt` docs, the two skill repos vendored under `.claude/skills/`, and
+the `@0gfoundation/0g-cc` MCP server.
+
+**Not offered — a place to run your agent.** No 0G product hosts an application. If the
+demo needs a 0G integration that is defensible, it is Compute or Storage, not hosting.
+
 ## 0G Sandbox — verified endpoints (2026-07-25)
 
-The hosted testnet broker is live; no TDX hardware of our own is needed.
+Curled directly, not summarised. Live, but officially undocumented — a phase 0 candidate,
+not a decision.
 
 | | |
 |---|---|

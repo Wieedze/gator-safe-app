@@ -13,7 +13,8 @@
     "test:flow": "node test/test-full-flow.mjs",
     "test:unit": "bun test test/unit",
     "test:aqua-fork": "bun scripts/aqua-fork-check.ts",
-    "publisher": "bun server/intuition-publisher.ts"
+    "publisher": "bun server/intuition-publisher.ts",
+    "mandate-assistant": "bun server/mandate-assistant.ts"
   },
   "dependencies": {
     "@0xintuition/graphql": "^3.0.1",

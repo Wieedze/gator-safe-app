@@ -27,6 +27,11 @@ ENV VITE_INTUITION_PUBLISHER_SECRET=$VITE_INTUITION_PUBLISHER_SECRET
 # only matters for non-container builds / when no runtime config is injected.
 ARG VITE_INTUITION_NETWORK=testnet
 ENV VITE_INTUITION_NETWORK=$VITE_INTUITION_NETWORK
+# Public URL of the agent service (server/Dockerfile.agent, its own Coolify service).
+# Not a secret — it is an address the browser calls. Left empty, the Limit order tab
+# only offers the self-run agent path, so a deploy without the service is unchanged.
+ARG VITE_AGENT_SERVICE_URL
+ENV VITE_AGENT_SERVICE_URL=$VITE_AGENT_SERVICE_URL
 RUN bun run build
 # -> /app/dist (asset URLs prefixed with /safe-app/)
 

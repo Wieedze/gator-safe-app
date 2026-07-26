@@ -7,6 +7,10 @@ import {
   decodePeriodTransferTerms,
   findStreamingCaveat,
   decodeStreamingTerms,
+  findBalanceChangeCaveat,
+  decodeBalanceChangeTerms,
+  findApproveTargetToken,
+  findExactExecutionCaveat,
   periodFromSeconds,
 } from './discover'
 import type { DelegationDetails } from './delegation-document'
@@ -149,6 +153,27 @@ export function detailsFromDelegation(
       period: 'month',
     }
   }
+  const dca = findBalanceChangeCaveat(delegation, chainId)
+  if (dca) {
+    const { amount } = decodeBalanceChangeTerms(dca.terms)
+    return {
+      kind: 'dca',
+      amount: formatUnits(amount, token.decimals),
+      tokenSymbol: token.symbol,
+      period: 'swap',
+    }
+  }
+  // The approve companion of a limit order: no balance-change bound, so it must be
+  // matched last. Its display carries no amount/period — it only grants the router
+  // an allowance so the paired swap can run.
+  if (findApproveTargetToken(delegation, chainId)) {
+    return { kind: 'approve', amount: '', tokenSymbol: token.symbol, period: '' }
+  }
+  // A yield step pins an exact execution: no token, no amount, no period. Matched last
+  // so it never shadows a mandate that does carry one.
+  if (findExactExecutionCaveat(delegation, chainId)) {
+    return { kind: 'yield', amount: '', tokenSymbol: '', period: '' }
+  }
   return null
 }
 
@@ -158,5 +183,10 @@ export function tokenFromDelegation(delegation: DelegationStruct, chainId: numbe
   if (sub) return decodePeriodTransferTerms(sub.terms).token
   const stream = findStreamingCaveat(delegation, chainId)
   if (stream) return decodeStreamingTerms(stream.terms).token
+  const dca = findBalanceChangeCaveat(delegation, chainId)
+  if (dca) return decodeBalanceChangeTerms(dca.terms).token
+  // The approve companion: its token is the allowedTargets (the funding token).
+  const approveToken = findApproveTargetToken(delegation, chainId)
+  if (approveToken) return approveToken
   return null
 }

@@ -5,15 +5,20 @@ import { DeleGatorModuleFactoryABI, SafeABI } from '../config/abis'
 import { getAddresses } from '../config/addresses'
 import { buildModuleInstallTxs, DEFAULT_SALT } from '../lib/module'
 import { getDelegations, type StoredDelegation } from '../lib/storage'
-import { useFinalizePending } from '../hooks/useFinalizePending'
+import { useUniswapPools } from '../hooks/useUniswapPools'
+import { useSafeYieldPlans, type YieldPlanStep } from '../hooks/useSafeYieldPlans'
+import { PlanFolder } from '../ui/PlanFolder'
+import { buildRevokeTxs } from '../lib/revoke'
+import { getLimitOrderExecution } from '../lib/limitOrderStatus'
 import { portalAtomUrl } from '../lib/intuition'
-import { periodToSeconds, isPeriodType } from '../lib/enforcers'
 import { SubscriptionDetail } from './SubscriptionDetail'
-import { Card, Btn, StatusBadge, Payee, type Status } from '../ui/components'
+import { Card, Btn, StatusBadge, Payee, STATUS, type Status } from '../ui/components'
 import { IconChip, IconCheck, IconPlus, IconRepeat, IconLock, IconCube, IconExt, IconAlert, IconArrowR } from '../ui/icons'
 import { findChain, rpcUrl } from '../config/supported-chains'
 
-type Page = 'home' | 'create' | 'redeem'
+// Kept in step with App.tsx's Page union — this had drifted behind the routes added
+// since, so Overview could not link to them.
+type Page = 'home' | 'create' | 'redeem' | 'yield' | 'strategy' | 'limit' | 'aqua'
 
 function tintFor(addr: string): { tint: string; logo: string } {
   const palette = ['#3B82F6', '#22D3EE', '#8B5CF6', '#34D399', '#FB7185', '#FBBF24']
@@ -21,25 +26,33 @@ function tintFor(addr: string): { tint: string; logo: string } {
   for (let i = 2; i < addr.length; i++) h = (h * 31 + addr.charCodeAt(i)) >>> 0
   return { tint: palette[h % palette.length], logo: addr.slice(2, 4).toUpperCase() }
 }
-function statusOf(s: StoredDelegation['meta']['status']): Status {
+function statusOf(s: StoredDelegation['meta']['status'], executed = false): Status {
+  if (executed) return 'executed'
   return s === 'signed' ? 'active' : s === 'revoked' ? 'revoked' : 'pending'
 }
 const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`
 
-function SubCard({ d, onOpen }: { d: StoredDelegation; onOpen: () => void }) {
-  const status = statusOf(d.meta.status)
+function SubCard({ d, onOpen, executedTx }: { d: StoredDelegation; onOpen: () => void; executedTx?: string }) {
+  const status = statusOf(d.meta.status, executedTx !== undefined)
   const stream = d.meta.scopeType === 'erc20Streaming'
   const payeeAddr = d.meta.recipient ?? d.delegation.delegate
   const { tint, logo } = tintFor(payeeAddr)
-  const dim = status === 'revoked'
+  const dim = status === 'revoked' || status === 'executed'
   return (
     <Card hover onClick={onOpen} className={`p-5 cursor-pointer relative ${dim ? 'opacity-70' : ''}`}>
-      <span className="absolute left-0 top-5 bottom-5 w-[3px] rounded-full" style={{ background: status === 'active' ? '#34D399' : status === 'pending' ? '#FBBF24' : '#FB7185' }} />
+      <span className="absolute left-0 top-5 bottom-5 w-[3px] rounded-full" style={{ background: STATUS[status].dot }} />
       <div className="flex items-start justify-between gap-3">
         <Payee logo={logo} tint={tint} name={d.meta.label} addr={short(payeeAddr)} />
         <div className="flex items-center gap-2 shrink-0">
           {stream && <span className="inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wide" style={{ color: '#22D3EE' }}><IconRepeat size={11} /> stream</span>}
-          <StatusBadge status={status} size="sm" />
+          {status === 'executed' && executedTx ? (
+            <a href={executedTx} target="_blank" rel="noreferrer" onClick={(e) => e.stopPropagation()} className="inline-flex items-center gap-1" title="View execution tx">
+              <StatusBadge status={status} size="sm" />
+              <IconExt size={12} className="text-faint" />
+            </a>
+          ) : (
+            <StatusBadge status={status} size="sm" />
+          )}
         </div>
       </div>
       <div className="mt-5 flex items-end gap-2">
@@ -87,16 +100,61 @@ function SubCard({ d, onOpen }: { d: StoredDelegation; onOpen: () => void }) {
 
 export default function Home({ onNavigate }: { onNavigate: (page: Page) => void }) {
   const { sdk, safe } = useSafeAppsSDK()
-  // Finalize-on-open: recover finalized delegations from the Safe tx-service and
-  // index them, independent of when the Nth owner signed (ADR 0005).
-  useFinalizePending()
   const [moduleStatus, setModuleStatus] = useState<'loading' | 'installed' | 'not-installed' | 'error'>('loading')
   const [moduleAddress, setModuleAddress] = useState<Address | null>(null)
   const [installing, setInstalling] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [safeInfo, setSafeInfo] = useState<{ owners: string[]; threshold: number } | null>(null)
   const [subs, setSubs] = useState<StoredDelegation[]>(() => getDelegations())
+  // Positions are NFTs and carry no mandate; the plans do, so strategy cards open the
+  // same detail + revoke every other delegation on this Safe uses. Reuses the module
+  // address this page already resolves for its status banner.
+  const yieldPlans = useSafeYieldPlans(moduleAddress ?? undefined, safe.chainId)
+  const [revokingHash, setRevokingHash] = useState<string | null>(null)
+  const uniswapPools = useUniswapPools(safe.chainId)
+
+  /** The pool a plan deposits into, matched on the pair and fee its mint pinned. */
+  function apyFor(plan: { deposit: { token0: { address: string }; token1: { address: string }; fee: number } | null }): number | null {
+    const d = plan.deposit
+    if (!d) return null
+    const pool = uniswapPools.pools.find(
+      (p) =>
+        p.fee === d.fee &&
+        p.token0.address.toLowerCase() === d.token0.address.toLowerCase() &&
+        p.token1.address.toLowerCase() === d.token1.address.toLowerCase(),
+    )
+    return pool?.apy ?? null
+  }
+
+  async function revokeStep(step: YieldPlanStep) {
+    const hash = step.delegation.meta.delegationHash
+    setRevokingHash(hash)
+    try {
+      await sdk.txs.send({ txs: buildRevokeTxs(step.delegation, safe.chainId) })
+      yieldPlans.refresh()
+    } catch {
+      // The Safe surfaces its own rejection; nothing useful to add here.
+    } finally {
+      setRevokingHash(null)
+    }
+  }
   const [selected, setSelected] = useState<StoredDelegation | null>(null)
+  // Limit orders are one-shot; once fired on-chain, show them as Executed not Active,
+  // with a link to the redemption tx. Keyed by delegationHash → explorer URL ('' = no link).
+  const [executed, setExecuted] = useState<Map<string, string>>(new Map())
+
+  useEffect(() => {
+    const orders = subs.filter((d) => d.meta.strategyKind === 'limitOrder' && d.meta.status === 'signed')
+    if (orders.length === 0) return
+    let cancelled = false
+    Promise.all(orders.map(async (d) => {
+      const ex = await getLimitOrderExecution(d.meta.chainId, d.meta.delegationHash, d.meta.createdAt)
+      return ex.executed ? ([d.meta.delegationHash.toLowerCase(), ex.txUrl ?? ''] as const) : null
+    }))
+      .then((hits) => { if (!cancelled) setExecuted(new Map(hits.filter((h): h is readonly [string, string] => h !== null))) })
+      .catch(() => {})
+    return () => { cancelled = true }
+  }, [subs])
 
   function refresh() {
     const next = getDelegations()
@@ -164,13 +222,14 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
   }
 
   const active = subs.filter((s) => s.meta.status === 'signed')
-  // Monthly run-rate: normalise each active subscription's amount to a per-month
-  // figure from its period, so a daily/weekly/minutely cap still contributes.
-  const SECONDS_PER_MONTH = Number(periodToSeconds('monthly'))
+  // Total engaged: the plain sum of each active mandate's headline amount — the same
+  // figure shown on its card (a stream shows its per-period rate, everything else its
+  // amount). No per-period normalisation, so a limit order (period 'swap') or any
+  // non-recurring mandate is counted too.
   const committed = active.reduce((sum, s) => {
-    const amount = parseFloat((s.meta.amount ?? '0').replace(/,/g, ''))
-    if (!Number.isFinite(amount) || !isPeriodType(s.meta.period)) return sum
-    return sum + amount * (SECONDS_PER_MONTH / Number(periodToSeconds(s.meta.period)))
+    const shown = s.meta.scopeType === 'erc20Streaming' ? s.meta.ratePerPeriod : s.meta.amount
+    const amount = parseFloat((shown ?? '0').replace(/,/g, ''))
+    return Number.isFinite(amount) ? sum + amount : sum
   }, 0)
 
   return (
@@ -184,7 +243,7 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
             </div>
             <div className="min-w-0">
               <div className="text-sm font-semibold text-ink flex items-center gap-2">
-                OurGlass module enabled
+                HourGlass module enabled
                 <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-active"><IconCheck size={12} /> ready</span>
               </div>
               <div className="text-xs text-dim font-mono truncate">
@@ -198,7 +257,7 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
           <div className="flex items-start gap-3">
             <div className="grid place-items-center w-9 h-9 rounded-xl shrink-0 bg-raised text-danger ring-1 ring-line"><IconAlert size={18} /></div>
             <div className="flex-1 min-w-0">
-              <div className="text-sm font-semibold text-ink">OurGlass module not installed</div>
+              <div className="text-sm font-semibold text-ink">HourGlass module not installed</div>
               <p className="text-xs text-dim mt-1 leading-relaxed">Enable the DeleGator (ERC-7710) module on your Safe to start creating subscriptions. One-time setup — all signers approve.</p>
               {moduleAddress && <p className="text-[11px] text-faint font-mono mt-2 truncate">module: {moduleAddress}</p>}
               <div className="mt-3">
@@ -219,11 +278,44 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
         </div>
       )}
 
+      {/* Recovered from the graph and the chain, so they survive a reload. The plan card
+          already carries the pair, the amounts and the yield — a separate positions strip
+          only said the same thing twice. */}
+      {yieldPlans.plans.length > 0 && (
+        <div className="mb-6">
+          <div className="flex items-end justify-between gap-4 mb-6">
+            <div>
+              <h1 className="text-2xl font-extrabold tracking-tight text-ink">Agentic DeFi strategies</h1>
+              <p className="text-dim text-sm mt-1">Positions an agent opened and manages under a capped mandate.</p>
+            </div>
+            <Btn kind="ghost" onClick={() => onNavigate('yield')}>Manage</Btn>
+          </div>
+          {yieldPlans.plans.length > 0 && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+              {yieldPlans.plans.map((pl) => (
+                <PlanFolder
+                  key={pl.agentAddress}
+                  plan={pl}
+                  apy={apyFor(pl)}
+                  onOpenStep={(st) => setSelected(st.delegation)}
+                  onRevokeStep={(st) => void revokeStep(st)}
+                  revokingHash={revokingHash}
+                />
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Separated because they answer different questions: strategies are what an
+          agent runs on the treasury, operations are what the treasury pays out. */}
+      <div className="border-t border-line mb-6" />
+
       {/* Header */}
       <div className="flex items-end justify-between gap-4 mb-6">
         <div>
-          <h1 className="text-2xl font-extrabold tracking-tight text-ink">Subscriptions</h1>
-          <p className="text-dim text-sm mt-1">Recurring USDC charges, capped on-chain.</p>
+          <h1 className="text-2xl font-extrabold tracking-tight text-ink">Operations</h1>
+          <p className="text-dim text-sm mt-1">Subscriptions, streams and orders — each capped on-chain.</p>
         </div>
         <Btn kind="primary" icon={<IconPlus size={18} />} onClick={() => onNavigate('create')}>New subscription</Btn>
       </div>
@@ -231,13 +323,13 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
       {/* Stats (no ETH-spent / gasless stat by design choice) */}
       <div className="mb-6">
         <Card className="p-4">
-          <div className="flex items-center gap-2 text-xs text-faint"><IconRepeat size={16} /> Committed / month</div>
+          <div className="flex items-center gap-2 text-xs text-faint"><IconRepeat size={16} /> Total engaged</div>
           <div className="mt-2 font-mono font-bold text-ink tnum" style={{ fontSize: 24 }}>${committed.toLocaleString('en-US', { minimumFractionDigits: 2 })}</div>
-          <div className="text-xs text-dim mt-1">{active.length} active subscription{active.length === 1 ? '' : 's'}</div>
+          <div className="text-xs text-dim mt-1">{active.length} active mandate{active.length === 1 ? '' : 's'}</div>
         </Card>
       </div>
 
-      {/* Subscriptions grid */}
+      {/* Operations */}
       {subs.length === 0 ? (
         <Card className="p-8 text-center">
           <p className="text-dim text-sm">No subscriptions yet.</p>
@@ -248,7 +340,7 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
       ) : (
         <div className="grid grid-cols-2 gap-4">
           {subs.map((d) => (
-            <SubCard key={d.meta.delegationHash} d={d} onOpen={() => setSelected(d)} />
+            <SubCard key={d.meta.delegationHash} d={d} onOpen={() => setSelected(d)} executedTx={executed.get(d.meta.delegationHash.toLowerCase())} />
           ))}
         </div>
       )}

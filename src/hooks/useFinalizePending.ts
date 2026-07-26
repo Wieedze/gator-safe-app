@@ -54,39 +54,58 @@ function localRecordFor(messageHash: Hex): { organization?: OrganizationInput; d
   return { organization, delegationHash: stored.meta.delegationHash }
 }
 
+/**
+ * The finalize pass itself, callable outside the mount effect. Extracted so the Limit
+ * order tab can run it on demand: the agent discovers its mandate on Intuition, so
+ * starting one before this has run would fail on a mandate that is merely unindexed.
+ *
+ * Returns the atom id published per delegationHash. The pin is deterministic (ADR 0005),
+ * so a caller that knows its own hash learns exactly which atom to expect — and an empty
+ * result for a hash it just signed means the poke did not take.
+ */
+export async function finalizePending(
+  chainId: number,
+  safeAddress: Address,
+  isCancelled: () => boolean = () => false,
+): Promise<Map<string, string>> {
+  const published = new Map<string, string>()
+  if (!intuitionPublisherUrl()) return published
+  const messages = await listSafeMessages(chainId, safeAddress)
+  const poked = pokedSet()
+  for (const msg of messages) {
+    if (isCancelled()) return published
+    if (!isMessageComplete(msg)) continue
+    if (poked.has(msg.messageHash.toLowerCase())) continue
+    if (!delegationFromMessage(msg, chainId)) continue // not an OurGlass delegation
+
+    const { organization, delegationHash } = localRecordFor(msg.messageHash)
+    try {
+      const res = await pokePublish({ chainId, safeAddress, messageHash: msg.messageHash, organization })
+      markPoked(msg.messageHash.toLowerCase())
+      if (delegationHash) {
+        published.set(delegationHash.toLowerCase(), res.result.atoms.delegationJson)
+        setDelegationIntuition(delegationHash, {
+          atomId: res.result.atoms.delegationJson,
+          network: res.result.network,
+        })
+      }
+    } catch {
+      // transient (tx-service / backend) — retried on the next app open
+    }
+  }
+  return published
+}
+
 export function useFinalizePending(): void {
   const { safe } = useSafeAppsSDK()
   const safeAddress = safe?.safeAddress as Address | undefined
   const chainId = safe?.chainId
 
   useEffect(() => {
-    if (!safeAddress || !chainId || !intuitionPublisherUrl()) return
+    if (!safeAddress || !chainId) return
     let cancelled = false
 
-    ;(async () => {
-      const messages = await listSafeMessages(chainId, safeAddress)
-      const poked = pokedSet()
-      for (const msg of messages) {
-        if (cancelled) return
-        if (!isMessageComplete(msg)) continue
-        if (poked.has(msg.messageHash.toLowerCase())) continue
-        if (!delegationFromMessage(msg, chainId)) continue // not an OurGlass delegation
-
-        const { organization, delegationHash } = localRecordFor(msg.messageHash)
-        try {
-          const res = await pokePublish({ chainId, safeAddress, messageHash: msg.messageHash, organization })
-          markPoked(msg.messageHash.toLowerCase())
-          if (delegationHash) {
-            setDelegationIntuition(delegationHash, {
-              atomId: res.result.atoms.delegationJson,
-              network: res.result.network,
-            })
-          }
-        } catch {
-          // transient (tx-service / backend) — retried on the next app open
-        }
-      }
-    })()
+    void finalizePending(chainId, safeAddress, () => cancelled)
 
     return () => {
       cancelled = true

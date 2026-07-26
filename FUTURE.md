@@ -2,6 +2,50 @@
 
 Deferred ideas captured during tasks (per workflow rules — scope discipline).
 
+- **[COST] Who pays the agent's compute.** Per `docs/AGENT_EXECUTION_PLAN.md` the agent
+  runs as a 0G Tapp instance, billed per minute. For the demo Hourglass pays it from its
+  own 0G deposit — the same call as the shared Uniswap key.
+
+  The intended end state is the operator paying for their own order's compute, but that
+  is not a config change: 0G bills by deposit into a contract **on 0G Chain**, settled in
+  EIP-712 vouchers signed by the TEE key. The operator's Safe is on Base, so charging
+  them directly means a second chain and a second token on top of the ETH gas top-up
+  they already do. Options when it matters: operator deposits on 0G directly (worst UX,
+  simplest to build), Hourglass fronts it and bills back on Base, or the cost comes out
+  of the swap. Undecided — revisit with the two-chain note in
+  `docs/0G-INTEGRATION-MAP.md §4.3`.
+
+- **[COST] Agent gas residue has no return path to the Safe.** Per ADR 0007 the agent
+  wallet is funded from the Safe after the mandate is signed, and pays its own gas for
+  `redeemDelegations`. Whatever it does not spend stays on an address whose key only
+  the agent runtime holds — `ModuleTransfer` sweeps the DeleGator module, not the agent
+  wallet. Under limit-order-only scope a mandate fires once, so the leftover is the
+  top-up minus one redeem; a mandate whose trigger price never hits strands the whole
+  amount indefinitely.
+
+  **Accepted as a known loss for v1** (user decision, 2026-07-25) — bounded by the
+  top-up size, so keep the funding sized to one redeem plus a modest margin.
+
+  **What closing it needs:** a sweep instruction in the runner returning the balance to
+  the Safe, on three triggers — after a successful fill, after `disableDelegation`, and
+  on abandonment. The third is the hard one: an unfilled limit order emits no on-chain
+  event saying "this is over", so abandonment needs either an operator action in the
+  app or an expiry (a `TimestampEnforcer` on the mandate would give the runner a
+  deadline to sweep against). Revisit alongside the DCA rail, which turns this from a
+  one-shot leftover into a recurring top-up/refill problem.
+
+- **[DCA] The DCA rail needs the same Permit2 setup the limit order got.** Proven on
+  the limit order: the Uniswap Universal Router 2.0 pulls the funding token through
+  Permit2 (verified — `check_approval` always returns the Permit2 spender on Base, no
+  legacy toggle exposed; the `/swap` calldata is a bare `V3_SWAP_EXACT_IN` with no inline
+  `PERMIT2_PERMIT`). So `run-dca.ts`'s approve+swap redeem hits `AllowanceExpired` too
+  unless the Safe has a standing Permit2 allowance for the router. The fix mirrors the
+  limit order: a one-time "Enable trading" setup (`src/lib/permit2.ts`) + drop the
+  in-mandate approve, redeeming the swap alone. Until then the DCA docs are stale:
+  `getting-started.mdx` (line ~59, "approve directly to the router, not Permit2") and
+  `references/execution-dca.md` ("approve + swap in one atomic call") describe the
+  pre-Permit2 flow. Deferred with the rest of DCA.
+
 - **Multi-token redeem stats.** `StatsRow` / `sumDisplay` on the Charge page sum
   claimable/claimed across token groups under a single hardcoded "USDC" label.
   Correct for the current USDC-centric POC (amounts are grouped per token with
@@ -17,8 +61,10 @@ Deferred ideas captured during tasks (per workflow rules — scope discipline).
   **Impact today: none on testnet.** All three testnet predicates (`owns`,
   `in context of`, `delegate to`) are now reused by term_id, so the publish path
   never pins. What still needs the pin path:
-  - **mainnet**: its `delegate to` atom does not exist yet (verified: the label
-    returns no atoms), so the first mainnet publish must create it.
+  - **mainnet**: the `delegate to` atom now EXISTS (term_id
+    `0xc587d8f586380d2252d01784a3b6b889a50f960af80cc0d8acb4dbd3e2c2c1f5`,
+    verified against the live graph 2026-07-25 — the first mainnet publish created
+    it). The read path pins nothing; it matches this id directly.
   - **creating a brand-new Organization atom by name** (`pinOrganization`).
 
   **When the key arrives:** add the auth header to `createGraphqlPinner`
@@ -43,6 +89,47 @@ Deferred ideas captured during tasks (per workflow rules — scope discipline).
   singleton process, reorg/receipt-status handling, and a block-cursor decision:
   stateless rescan-window vs persisted cursor). Reintroduce if the "used but
   never reopened" case proves real. Design context in ADR 0005.
+
+- **[UX] Populate Overview from Intuition, keyed by the Safe (delegator).** Now
+  that signing no longer writes to `localStorage`, the Overview (`Home.tsx`, which
+  reads `getDelegations()`) shows nothing for a Safe whose delegations were signed
+  elsewhere. Since every mandate is discoverable on Intuition via the delegator,
+  the Overview should list the connected Safe's delegations read from the graph.
+  Source of truth: **Intuition only** (by the Safe) — consistent with dropping the
+  local store; it shows only published mandates, not unpublished drafts.
+
+  **Work:** the current discovery (`discoverIncomingDelegations`,
+  `src/lib/intuition/discover.ts`) traverses by the **agent** (recipient / delegate
+  atom → `delegate to` triples where it is the OBJECT). Overview needs the mirror:
+  a `discoverBySafe(safeModuleAddress, chainId)` that starts from the delegator
+  atom and finds `delegate to` triples where it is the **subject**, then the same
+  `in context of` → IPFS doc → `toStoredDelegation` tail. Add a hook
+  (`useSafeDelegations`) owning load/error state, and point `Home` at it instead of
+  `getDelegations()`. Note the delegator atom is the Safe's **module** address
+  (`delegation.delegator`), not the Safe address itself — resolve it the same way
+  the create flow predicts the module (factory `predictAddress`).
+
+- **[SECURITY] Per-period cap on the compound mandate (`increaseLiquidity` is
+  amount-unbounded).** The compound mandate (`src/lib/compoundDelegation.ts`)
+  scopes `collect` + `increaseLiquidity` on the PositionManager but does not cap
+  the `increaseLiquidity` amounts: a compromised agent could add more of the
+  Safe's own token balance into the LP than just the harvested fees (over-
+  allocation into the Safe's own position — not theft, but unbounded).
+
+  **Shipped mitigation (POC):** the "Enable compounding" setup approves a
+  *bounded* amount from the Safe to the PositionManager (not `MAX_UINT256`), so
+  the agent can never pull more than the approved sum — a real, non-zero blast-
+  radius cap. Weakness: it is a lifetime cap that `increaseLiquidity` consumes,
+  not a per-period bound, so it needs topping up.
+
+  **Pre-prod hardening (deferred, decided 2026-07-25 with team):** add an
+  on-chain per-period guard to the mandate — an `erc20BalanceChange`-style /
+  period cap enforcer bounding how much the Safe balance can drop per window.
+  This is the correct "Hereda" bound (periodic, not lifetime). Deferred because
+  the SDK's `erc20BalanceChange` builder rejects `balance <= 0n` (the same
+  `Decrease(0)` limit hit on the treasury-protection caveat), so it needs either
+  an SDK-level fix or a hand-encoded caveat + tests. Revisit before any mainnet
+  or real-treasury use.
 
 - **[SECURITY] Unbounded token metadata (`symbol`/`name`/`decimals`) is a
   hostile input.** `readErc20Meta` (`src/lib/erc20.ts:43`) reads a custom

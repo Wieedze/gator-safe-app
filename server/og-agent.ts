@@ -128,12 +128,15 @@ Your shell already starts in the runner directory. Do not cd anywhere.
 Create a fresh EVM keypair and write it to ${WALLET_FILE} in that directory, as JSON with
 exactly two keys: "address" (0x + 40 hex chars) and "privateKey" (0x + 64 hex chars).
 
-Generate it with a real tool — 'cast wallet new', or a bun script using
-privateKeyToAccount and generatePrivateKey from viem/accounts (viem is already installed
-in node_modules). NEVER write a key you composed yourself, and never reuse an example key
-from documentation: the mandate will be signed to this address, so a guessable key is a
-broken agent. The caller verifies that the private key really derives the address and
-rejects known-weak values.
+Generate it with viem, which is already installed in node_modules. This one-liner does
+the whole job — run it as-is:
+
+bun -e 'import {generatePrivateKey,privateKeyToAccount} from "viem/accounts";const privateKey=generatePrivateKey();const {address}=privateKeyToAccount(privateKey);require("fs").writeFileSync("${WALLET_FILE}",JSON.stringify({address,privateKey},null,2));console.log(address)'
+
+NEVER write a key you composed yourself, and never reuse an example key from
+documentation: the mandate will be signed to this address, so a guessable key is a broken
+agent. The caller verifies that the private key really derives the address and rejects
+known-weak values.
 
 Then call done(). Do not run the limit order.`
 }

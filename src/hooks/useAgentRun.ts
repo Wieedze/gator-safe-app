@@ -41,7 +41,6 @@ export function useAgentRun(): UseAgentRun {
   const polling = useRef(false)
 
   const provision = useCallback(async () => {
-    if (!baseUrl) return
     setError(null)
     setProvisioning(true)
     try {
@@ -57,7 +56,7 @@ export function useAgentRun(): UseAgentRun {
 
   const start = useCallback(
     async (instruction: AgentInstruction) => {
-      if (!baseUrl || !id) return
+      if (!id) return
       setError(null)
       setStarting(true)
       try {
@@ -73,7 +72,7 @@ export function useAgentRun(): UseAgentRun {
   )
 
   useEffect(() => {
-    if (!baseUrl || !id || !polling.current) return
+    if (!id || !polling.current) return
     let cancelled = false
     const timer = setInterval(() => {
       void getAgentRun(baseUrl, id)
@@ -93,7 +92,9 @@ export function useAgentRun(): UseAgentRun {
   }, [baseUrl, id, run?.state])
 
   return {
-    available: baseUrl !== undefined,
+    // The service is always reachable in principle (same-origin by default); whether
+    // it is configured shows up as a provisioning error, not as a hidden option.
+    available: true,
     agentAddress,
     run,
     provisioning,

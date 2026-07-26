@@ -30,8 +30,12 @@ export interface AgentInstruction {
   triggerPrice: string
 }
 
-/** Configured at build time; without it the agent option is not offered. */
-export const AGENT_SERVICE_URL: string | undefined = import.meta.env.VITE_AGENT_SERVICE_URL
+/**
+ * Defaults to the same-origin path Caddy reverse-proxies to the agent service running
+ * in this same container — so prod and every preview work with no per-env config, and
+ * with no CORS. Override only to point at an external agent service.
+ */
+export const AGENT_SERVICE_URL: string = import.meta.env.VITE_AGENT_SERVICE_URL || '/agent'
 
 async function call<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, {

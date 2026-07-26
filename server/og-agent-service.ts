@@ -27,7 +27,7 @@
  *
  * Run: OG_ROUTER_API_KEY=sk-... UNISWAP_API_KEY=... bun server/og-agent-service.ts
  */
-import { mkdirSync, existsSync, writeFileSync, readFileSync, cpSync, symlinkSync, renameSync, rmSync } from 'node:fs'
+import { mkdirSync, existsSync, writeFileSync, readFileSync, readdirSync, cpSync, symlinkSync, renameSync } from 'node:fs'
 import { resolve, join } from 'node:path'
 import { privateKeyToAccount } from 'viem/accounts'
 import { createPublicClient, http, isAddress, isHex, type Address, type Hex } from 'viem'
@@ -146,9 +146,12 @@ async function provisionByModel(): Promise<Run> {
 
   const id = address.slice(2, 10).toLowerCase()
   renameSync(dir, runDir(id))
-  rmSync(join(runDir(id), 'agent-wallet.json'), { force: true })
 
   const run: Run = { id, address, privateKey, state: 'provisioned', detail: null, startedAt: null, chainId: null }
+  // The key stays on disk, not just in this process. A restart between provisioning and
+  // start would otherwise destroy it — and the mandate is already signed to that address,
+  // so losing it means an order nobody can fill and gas nobody can recover.
+  writeFileSync(join(runDir(id), 'agent-wallet.json'), JSON.stringify({ address, privateKey }, null, 2))
   runs.set(id, run)
   return run
 }
@@ -308,9 +311,28 @@ Bun.serve({
   },
 })
 
+/** Runs outlive this process: rebuild the registry from the run directories at boot. */
+function restoreRuns(): void {
+  if (!existsSync(RUNS_DIR)) return
+  for (const entry of readdirSync(RUNS_DIR)) {
+    if (entry.startsWith('staging-')) continue
+    const walletPath = join(RUNS_DIR, entry, 'agent-wallet.json')
+    if (!existsSync(walletPath)) continue
+    try {
+      const { address, privateKey } = verifyWallet(JSON.parse(readFileSync(walletPath, 'utf8')) as unknown)
+      const log = logTailAt(join(RUNS_DIR, entry, 'agent.log'), 200)
+      const state: RunState = log.includes('done: filled') ? 'filled' : log.includes('done: blocked') ? 'blocked' : 'provisioned'
+      runs.set(entry, { id: entry, address, privateKey, state, detail: null, startedAt: null, chainId: null })
+    } catch {
+      // A run directory we cannot read is not a reason to refuse to boot.
+    }
+  }
+}
+
 mkdirSync(RUNS_DIR, { recursive: true })
+restoreRuns()
 console.log(
   ready
-    ? `og-agent-service on :${port} — runs in ${RUNS_DIR}`
+    ? `og-agent-service on :${port} — ${runs.size} run(s) restored from ${RUNS_DIR}`
     : `og-agent-service on :${port} — NOT READY (need OG_ROUTER_API_KEY and UNISWAP_API_KEY)`,
 )

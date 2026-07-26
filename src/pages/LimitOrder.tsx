@@ -189,17 +189,15 @@ export default function LimitOrder() {
       // Publish, then wait for the graph to catch up. Both have to happen before the
       // agent starts: it discovers its mandate on Intuition, so an unindexed mandate
       // makes a correct agent exit immediately and look broken.
-      const published = await finalizePending(safe.chainId, safe.safeAddress as Address)
-      // Already-published mandates are skipped by the poked set, so an absent hash is
-      // not a failure on a restart — only on the first start after signing.
-      if (!published.has(instruction.delegationHash.toLowerCase()) && !agentSvc.run) {
-        setError('The mandate was not published to Intuition. Reload the app and try again.')
-        return
-      }
+      // Publish, ignoring whether this particular call did the writing: the poked set
+      // skips a mandate already published in an earlier click, and that is a success,
+      // not a failure. Only discoverability decides — checked next, on the very path
+      // the agent uses.
+      await finalizePending(safe.chainId, safe.safeAddress as Address)
       setPublishStatus('Waiting for the mandate to be indexed…')
       const indexed = await waitForIndexing(instruction.delegationHash)
       if (!indexed) {
-        setError('The mandate was published but is not visible on Intuition yet. Wait a moment and start the agent again.')
+        setError('The mandate is not discoverable on Intuition yet — indexing can lag. Start the agent again in a moment.')
         return
       }
     } catch (err) {

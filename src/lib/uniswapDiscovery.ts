@@ -96,6 +96,19 @@ export interface PoolValueShare {
 }
 
 /**
+ * Price of token0 in terms of token1 (human units), from the pool's own
+ * `sqrtPriceX96` — no external feed. This is the exact ratio a **full-range**
+ * mint must be deposited at: Uniswap can only mint liquidity proportional to
+ * the current price, so a mismatched amount0:amount1 leaves one side mostly
+ * unused and can trip the mint's own slippage check (`amount0Min`/`amount1Min`
+ * in `uniswapPosition.ts`) — see the Yield tab's amount-matching inputs.
+ */
+export function priceOf0In1(pool: Pick<PoolInfo, 'sqrtPriceX96' | 'token0' | 'token1'>): number {
+  const sqrtPrice = Number(pool.sqrtPriceX96) / 2 ** 96
+  return sqrtPrice * sqrtPrice * 10 ** (pool.token0.decimals - pool.token1.decimals)
+}
+
+/**
  * Each token's share of the pool's value, derived only from the pool's own
  * on-chain price (`sqrtPriceX96`) and reserves — no USD price feed needed, so
  * it works even where the subgraph doesn't (e.g. Base Sepolia). Prices token0
@@ -106,18 +119,16 @@ export interface PoolValueShare {
  * compare (shouldn't happen for a pool with liquidity > 0).
  */
 export function poolValueShare(pool: PoolInfo): PoolValueShare | null {
-  const sqrtPrice = Number(pool.sqrtPriceX96) / 2 ** 96
-  const priceOf0In1 = sqrtPrice * sqrtPrice * 10 ** (pool.token0.decimals - pool.token1.decimals)
   const amount0 = Number(formatUnits(pool.tvlToken0, pool.token0.decimals))
   const amount1 = Number(formatUnits(pool.tvlToken1, pool.token1.decimals))
-  const value0In1 = amount0 * priceOf0In1
+  const value0In1 = amount0 * priceOf0In1(pool)
   const totalInToken1 = value0In1 + amount1
   if (!Number.isFinite(totalInToken1) || totalInToken1 <= 0) return null
   const pct0 = value0In1 / totalInToken1
 
   let usdEstimate: number | null = null
   if (STABLECOIN_SYMBOLS.has(pool.token1.symbol)) usdEstimate = totalInToken1
-  else if (STABLECOIN_SYMBOLS.has(pool.token0.symbol)) usdEstimate = amount0 + amount1 / priceOf0In1
+  else if (STABLECOIN_SYMBOLS.has(pool.token0.symbol)) usdEstimate = amount0 + amount1 / priceOf0In1(pool)
 
   return { pct0, pct1: 1 - pct0, usdEstimate }
 }

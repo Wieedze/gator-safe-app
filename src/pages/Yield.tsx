@@ -13,7 +13,7 @@ import { UNISWAP_V3_POSITION_MANAGER } from '../config/uniswap'
 import { DeleGatorModuleFactoryABI } from '../config/abis'
 import { DEFAULT_SALT } from '../lib/module'
 import { findChain, rpcUrl, chainName } from '../config/supported-chains'
-import { poolValueShare, type PoolInfo } from '../lib/uniswapDiscovery'
+import { poolValueShare, priceOf0In1, type PoolInfo } from '../lib/uniswapDiscovery'
 
 /** The signed yield plan, optionally carrying the auto-compound mandate (with its
  * salt-verifiable terms, so the agent needs no out-of-band interval config). */
@@ -224,6 +224,31 @@ export default function Yield() {
   }, [pool, amount1])
   const hasBalance0 = balances ? amount0Raw <= balances.token0 : false
   const hasBalance1 = balances ? amount1Raw <= balances.token1 : false
+
+  // A full-range mint can only use token0/token1 in the pool's current price ratio —
+  // anything else leaves one side mostly unused and can trip the mint's own slippage
+  // check (uniswapPosition.ts's amount0Min/amount1Min). Typing one side auto-fills the
+  // other at the pool's live price, so a manually-typed pair can't drift from it; the
+  // operator can still edit the result afterward if they want to fine-tune it.
+  function handleAmount0Change(raw: string) {
+    const cleaned = dec(raw)
+    setAmount0(cleaned)
+    if (!pool || !cleaned) return
+    const n = Number(cleaned)
+    if (!Number.isFinite(n)) return
+    const matched = n * priceOf0In1(pool)
+    if (Number.isFinite(matched)) setAmount1(matched.toFixed(Math.min(pool.token1.decimals, 8)))
+  }
+  function handleAmount1Change(raw: string) {
+    const cleaned = dec(raw)
+    setAmount1(cleaned)
+    if (!pool || !cleaned) return
+    const n = Number(cleaned)
+    const price = priceOf0In1(pool)
+    if (!Number.isFinite(n) || price <= 0) return
+    const matched = n / price
+    if (Number.isFinite(matched)) setAmount0(matched.toFixed(Math.min(pool.token0.decimals, 8)))
+  }
   // If auto-compound is on, the standing approval must be in place first — otherwise
   // the plan would sign fine but the compound agent would be permanently blocked
   // the moment it tried to harvest (see checkCompoundApprovals).
@@ -544,12 +569,16 @@ export default function Yield() {
           )}
 
           <div className={delegateReady ? 'space-y-4' : 'space-y-4 opacity-40 pointer-events-none select-none'} aria-disabled={!delegateReady}>
+            <p className="text-[11px] text-faint -mt-1">
+              A full-range position only accepts the pool's current price ratio — typing one amount fills the other to
+              match, so the mint can't revert on its own slippage check. Edit either side freely; they'll stay matched.
+            </p>
             <div className="grid grid-cols-2 gap-4">
               <Field label={`${pool.token0.symbol} amount`} required missing={amount0Raw > 0n && !hasBalance0}>
                 <input
                   type="text" inputMode="decimal"
                   value={amount0}
-                  onChange={(e) => setAmount0(dec(e.target.value))}
+                  onChange={(e) => handleAmount0Change(e.target.value)}
                   placeholder="0.00"
                   aria-label={`${pool.token0.symbol} amount`}
                   className={`font-mono ${amount0Raw > 0n && !hasBalance0 ? 'ring-1 ring-danger' : ''}`}
@@ -564,7 +593,7 @@ export default function Yield() {
                 <input
                   type="text" inputMode="decimal"
                   value={amount1}
-                  onChange={(e) => setAmount1(dec(e.target.value))}
+                  onChange={(e) => handleAmount1Change(e.target.value)}
                   placeholder="0.00"
                   aria-label={`${pool.token1.symbol} amount`}
                   className={`font-mono ${amount1Raw > 0n && !hasBalance1 ? 'ring-1 ring-danger' : ''}`}

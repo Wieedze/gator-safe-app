@@ -6,6 +6,7 @@ import { getAddresses } from '../config/addresses'
 import { buildModuleInstallTxs, DEFAULT_SALT } from '../lib/module'
 import { getDelegations, type StoredDelegation } from '../lib/storage'
 import { useSafePositions } from '../hooks/useSafePositions'
+import { useSafeYieldPlans } from '../hooks/useSafeYieldPlans'
 import { Positions } from '../ui/Positions'
 import { getLimitOrderExecution } from '../lib/limitOrderStatus'
 import { portalAtomUrl } from '../lib/intuition'
@@ -105,6 +106,10 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
   const [safeInfo, setSafeInfo] = useState<{ owners: string[]; threshold: number } | null>(null)
   const [subs, setSubs] = useState<StoredDelegation[]>(() => getDelegations())
   const positions = useSafePositions(safe.safeAddress as Address, safe.chainId)
+  // Positions are NFTs and carry no mandate; the plans do, so strategy cards open the
+  // same detail + revoke every other delegation on this Safe uses. Reuses the module
+  // address this page already resolves for its status banner.
+  const yieldPlans = useSafeYieldPlans(moduleAddress ?? undefined, safe.chainId)
   const [selected, setSelected] = useState<StoredDelegation | null>(null)
   // Limit orders are one-shot; once fired on-chain, show them as Executed not Active,
   // with a link to the redemption tx. Keyed by delegationHash → explorer URL ('' = no link).
@@ -257,6 +262,19 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
             <Btn kind="ghost" onClick={() => onNavigate('yield')}>Manage</Btn>
           </div>
           <Positions positions={positions.positions} loading={positions.loading} />
+          {yieldPlans.plans.length > 0 && (
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 mt-3">
+              {yieldPlans.plans.flatMap((pl) =>
+                pl.steps.map((st) => (
+                  <SubCard
+                    key={st.delegation.meta.delegationHash}
+                    d={st.delegation}
+                    onOpen={() => setSelected(st.delegation)}
+                  />
+                )),
+              )}
+            </div>
+          )}
         </div>
       )}
 

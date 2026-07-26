@@ -22,10 +22,10 @@ import { finalizePending } from '../hooks/useFinalizePending'
 import { discoverIncomingDelegations } from '../lib/intuition/discover'
 import type { AgentInstruction } from '../lib/agent-service'
 import { Block, Field, Segmented, PreviewRow } from '../ui/form'
+import { dec } from '../lib/numeric-input'
 import { IconLock, IconCheck, IconAlert } from '../ui/icons'
 
 const short = (a: string) => `${a.slice(0, 6)}…${a.slice(-4)}`
-const dec = (v: string) => v.replace(',', '.').replace(/[^\d.]/g, '')
 
 /** One redeem costs ~440k gas on Base; this covers it with room, and it is the loss
  *  ceiling if the order never fills (ADR 0007 — the residue has no return path yet). */

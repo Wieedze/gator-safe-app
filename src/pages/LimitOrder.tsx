@@ -18,6 +18,7 @@ import { findChain, rpcUrl } from '../config/supported-chains'
 import { saveDelegation } from '../lib/storage'
 import { Card, Btn, Mono, CopyChip } from '../ui/components'
 import { useAgentRun } from '../hooks/useAgentRun'
+import { finalizePending } from '../hooks/useFinalizePending'
 import type { AgentInstruction } from '../lib/agent-service'
 import { Block, Field, Segmented, PreviewRow } from '../ui/form'
 import { IconLock, IconCheck, IconAlert } from '../ui/icons'
@@ -56,6 +57,7 @@ export default function LimitOrder() {
   const [permit2Ready, setPermit2Ready] = useState<boolean | null>(null)
   const [permit2Busy, setPermit2Busy] = useState(false)
   const [fundingAgent, setFundingAgent] = useState(false)
+  const [publishing, setPublishing] = useState(false)
 
   const useCustom = tokenMode === 'custom'
   const fundingAddress = useCustom ? customToken : (selectedToken?.address ?? '')
@@ -158,6 +160,19 @@ export default function LimitOrder() {
   async function handleStartAgent() {
     setError(null)
     if (!recap) return
+    setPublishing(true)
+    try {
+      // Publish before starting. The agent discovers its mandate on Intuition, and
+      // until this runs the mandate is signed but unindexed — the run would exit on
+      // "not found on Intuition yet" and read as a failure. This is the same pass the
+      // app does on open; doing it here means the operator never has to reload.
+      await finalizePending(safe.chainId, safe.safeAddress as Address)
+    } catch {
+      // Already-published is the common case and it is a no-op; a real failure
+      // surfaces as the agent not finding the mandate, which says more than we could.
+    } finally {
+      setPublishing(false)
+    }
     await agentSvc.start(JSON.parse(recap) as AgentInstruction)
   }
 
@@ -400,10 +415,10 @@ export default function LimitOrder() {
                       kind="primary"
                       size="sm"
                       onClick={handleStartAgent}
-                      disabled={agentSvc.starting || agentSvc.run?.state === 'running'}
+                      disabled={publishing || agentSvc.starting || agentSvc.run?.state === 'running'}
                       className="w-full"
                     >
-                      {agentSvc.starting ? 'Starting…' : agentSvc.run ? 'Restart agent' : 'Start agent'}
+                      {publishing ? 'Publishing the mandate…' : agentSvc.starting ? 'Starting…' : agentSvc.run ? 'Restart agent' : 'Start agent'}
                     </Btn>
                     {agentSvc.run && (
                       <div className="rounded-lg bg-raised ring-1 ring-line p-3 space-y-1">

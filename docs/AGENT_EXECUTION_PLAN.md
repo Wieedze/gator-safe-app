@@ -170,6 +170,34 @@ longer than indexing. No retry loop needed at the trigger.
 - Moving IPFS pinning to 0G Storage — breaks CID-based discovery
   (`docs/0G-INTEGRATION-MAP.md §2.4`).
 
+## Proven end to end (2026-07-26)
+
+A 0G Compute model drove a live limit order to a fill on Base mainnet, unattended.
+
+| | |
+|---|---|
+| Redeem tx | `0xa55b7c5b7c6daca96feef287000904f3e36fe677c5a1d3ef00835a7560e5efb4` |
+| Block / gas | 49117693, 442,519 gas, status success |
+| `from` | `0x26fdbb73d95D5F62bdc9EbA78Ee33D1494C4229f` — the agent |
+| `to` | `0xdb9B1e94B5b69Df7e401DDbedE43491141047dB3` — DelegationManager |
+| Safe | `0x4f6ccab34C8dCD7722FeD01DCCd09FaBdfD391bF`, USDC 7.4050 → 6.4050, WETH +0.004575 |
+| Model | `0gm-1.0-35b-a3b` via `https://router-api.0g.ai/v1` |
+
+The model generated its own keypair (`cast wallet new`, verified to derive its address
+and to carry real entropy), discovered the mandate on Intuition by `delegationHash`,
+decoded the on-chain bounds, derived its own fill threshold — 0.000526 WETH for a 1900
+trigger — quoted Uniswap, and redeemed once `0.000533 ≥ 0.000526`.
+
+The `from` is the point: the transaction originates from the agent, not the Safe, and
+the bought WETH landed in the Safe. The spend came to exactly the 1 USDC cap.
+
+Three human actions, no more: sign the mandate, fund the gas, hand over the recap.
+
+**What this demonstrates.** The same model measured elsewhere in this repo substitutes
+tokens silently and obeys prompt injection (`server/mandate-assistant.ts` history). It
+drove a DAO treasury anyway, and the caveats held. That is a stronger claim than running
+the agent in a TEE: it needs no trust in the agent at all.
+
 ## What 0G actually offers
 
 Verified against primary sources (ADR 0008). Two separate things, do not conflate them:

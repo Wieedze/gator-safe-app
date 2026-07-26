@@ -14,10 +14,12 @@
  * exist before there is anything to sign. Funding must come after signing, so gas is
  * only committed to a mandate that exists.
  *
- * The key is generated here rather than by the model. The model's job is the part that
- * needs judgement — reading the market and deciding to fill; a keypair is one deterministic
- * call, and routing it through a shell would add latency and failure modes to a step with
- * no decision in it. Set AGENT_WALLET_BY_MODEL=1 to hand that step to the model instead.
+ * The model creates its own wallet, in its own shell, as the skill describes. What it
+ * cannot be trusted with is the quality of that key: a model that writes a key it composed
+ * itself, or copies one out of documentation, produces an address anyone can spend from —
+ * and the mandate gets signed to that address. So the key is verified here before the run
+ * is ever handed out: the private key must actually derive the address it claims, and must
+ * not be a small integer. A model that fails this does not get a fallback, it fails.
  *
  * Hourglass holds these keys. That is a deliberate reversal of the skill's non-custodial
  * stance, taken to remove friction for the DAO, and it is bounded: the mandate's caveats
@@ -25,9 +27,9 @@
  *
  * Run: OG_ROUTER_API_KEY=sk-... UNISWAP_API_KEY=... bun server/og-agent-service.ts
  */
-import { mkdirSync, existsSync, writeFileSync, readFileSync, cpSync, symlinkSync } from 'node:fs'
+import { mkdirSync, existsSync, writeFileSync, readFileSync, cpSync, symlinkSync, renameSync, rmSync } from 'node:fs'
 import { resolve, join } from 'node:path'
-import { generatePrivateKey, privateKeyToAccount } from 'viem/accounts'
+import { privateKeyToAccount } from 'viem/accounts'
 import { createPublicClient, http, isAddress, isHex, type Address, type Hex } from 'viem'
 import { base, mainnet } from 'viem/chains'
 import { isOriginAllowed, parseAllowedOrigins } from './cors'
@@ -76,13 +78,78 @@ function prepareRunDir(id: string): string {
   return dir
 }
 
-function provision(): Run {
-  const privateKey = generatePrivateKey()
-  const address = privateKeyToAccount(privateKey).address
+/**
+ * Accept the model's keypair only if it holds up. A key the model invented rather than
+ * generated would still parse — it just would not derive its own address, or it would be
+ * a small integer someone else can guess. Both are fatal: the mandate is signed to this
+ * address, so a guessable key hands the fill to anyone watching.
+ */
+function verifyWallet(raw: unknown): { address: Address; privateKey: Hex } {
+  if (typeof raw !== 'object' || raw === null) throw new Error('agent-wallet.json is not an object')
+  const w = raw as Record<string, unknown>
+  if (typeof w.privateKey !== 'string' || !isHex(w.privateKey) || w.privateKey.length !== 66) {
+    throw new Error('agent-wallet.json: privateKey must be 0x + 64 hex chars')
+  }
+  if (typeof w.address !== 'string' || !isAddress(w.address)) {
+    throw new Error('agent-wallet.json: address is not an address')
+  }
+  const privateKey = w.privateKey as Hex
+  const derived = privateKeyToAccount(privateKey).address
+  if (derived.toLowerCase() !== w.address.toLowerCase()) {
+    throw new Error(`agent-wallet.json: privateKey derives ${derived}, not the claimed ${w.address}`)
+  }
+  // A composed key is overwhelmingly likely to be small, patterned, or a doc example.
+  const value = BigInt(privateKey)
+  if (value < 2n ** 128n) throw new Error('agent-wallet.json: privateKey is far too small to be random')
+  return { address: derived, privateKey }
+}
+
+/**
+ * Spawn a subprocess and stream both its streams into a log file. Bun.spawn will not
+ * take a FileSink for stdout, so pipe and drain instead.
+ */
+function spawnLogged(cmd: string[], env: Record<string, string | undefined>, logPath: string) {
+  const proc = Bun.spawn(cmd, { cwd: resolve('.'), env, stdout: 'pipe', stderr: 'pipe' })
+  const sink = Bun.file(logPath).writer()
+  const drain = async (stream: ReadableStream<Uint8Array>): Promise<void> => {
+    for await (const chunk of stream) {
+      sink.write(chunk)
+      sink.flush()
+    }
+  }
+  const streams = Promise.all([drain(proc.stdout), drain(proc.stderr)])
+  const finished = proc.exited.then(async (code) => {
+    await streams
+    await sink.end()
+    return code
+  })
+  return { finished }
+}
+
+async function provisionByModel(): Promise<Run> {
+  const stagingId = `staging-${Date.now().toString(36)}`
+  const dir = prepareRunDir(stagingId)
+  const logPath = join(dir, 'provision.log')
+
+  const { finished } = spawnLogged(
+    ['bun', 'server/og-agent.ts', '--provision'],
+    { ...process.env, AGENT_WORKDIR: dir, AGENT_MAX_STEPS: process.env.PROVISION_MAX_STEPS ?? '12' },
+    logPath,
+  )
+  await finished
+
+  const walletPath = join(dir, 'agent-wallet.json')
+  if (!existsSync(walletPath)) {
+    throw new Error(`the agent did not produce a wallet. Log:\n${logTailAt(logPath)}`)
+  }
+  const { address, privateKey } = verifyWallet(JSON.parse(readFileSync(walletPath, 'utf8')) as unknown)
+
   const id = address.slice(2, 10).toLowerCase()
+  renameSync(dir, runDir(id))
+  rmSync(join(runDir(id), 'agent-wallet.json'), { force: true })
+
   const run: Run = { id, address, privateKey, state: 'provisioned', detail: null, startedAt: null, chainId: null }
   runs.set(id, run)
-  prepareRunDir(id)
   return run
 }
 
@@ -121,28 +188,23 @@ function launch(run: Run, instruction: Instruction): void {
   const dir = runDir(run.id)
   writeFileSync(join(dir, 'instruction.json'), JSON.stringify(instruction, null, 2))
   const logPath = join(dir, 'agent.log')
-  const log = Bun.file(logPath)
 
-  const proc = Bun.spawn(
+  const { finished } = spawnLogged(
     ['bun', 'server/og-agent.ts', join(dir, 'instruction.json')],
     {
-      cwd: resolve('.'),
-      env: {
-        ...process.env,
-        AGENT_PRIVATE_KEY: run.privateKey,
-        AGENT_WORKDIR: dir,
-        INTUITION_NETWORK: process.env.INTUITION_NETWORK ?? 'mainnet',
-      },
-      stdout: log.writer(),
-      stderr: log.writer(),
+      ...process.env,
+      AGENT_PRIVATE_KEY: run.privateKey,
+      AGENT_WORKDIR: dir,
+      INTUITION_NETWORK: process.env.INTUITION_NETWORK ?? 'mainnet',
     },
+    logPath,
   )
 
   run.state = 'running'
   run.startedAt = new Date().toISOString()
   run.chainId = instruction.chainId
 
-  void proc.exited.then((code) => {
+  void finished.then((code) => {
     const tail = existsSync(logPath) ? readFileSync(logPath, 'utf8') : ''
     if (tail.includes('done: filled')) {
       run.state = 'filled'
@@ -156,10 +218,13 @@ function launch(run: Run, instruction: Instruction): void {
   })
 }
 
-function logTail(id: string, lines = 40): string {
-  const path = join(runDir(id), 'agent.log')
+function logTailAt(path: string, lines = 40): string {
   if (!existsSync(path)) return ''
   return readFileSync(path, 'utf8').split('\n').slice(-lines).join('\n')
+}
+
+function logTail(id: string, lines = 40): string {
+  return logTailAt(join(runDir(id), 'agent.log'), lines)
 }
 
 function view(run: Run): Record<string, unknown> {
@@ -211,8 +276,12 @@ Bun.serve({
 
     if (req.method === 'POST' && url.pathname === '/provision') {
       if (!ready) return json({ error: 'not configured' }, 503, origin)
-      const run = provision()
-      return json({ id: run.id, agentAddress: run.address, state: run.state }, 200, origin)
+      try {
+        const run = await provisionByModel()
+        return json({ id: run.id, agentAddress: run.address, state: run.state }, 200, origin)
+      } catch (err) {
+        return json({ error: err instanceof Error ? err.message : 'provision failed' }, 502, origin)
+      }
     }
 
     if (parts[0] === 'runs' && parts[1]) {

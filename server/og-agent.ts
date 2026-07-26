@@ -114,6 +114,30 @@ async function complete(key: string, messages: Message[]): Promise<Message> {
   return message
 }
 
+const WALLET_FILE = 'agent-wallet.json'
+
+function provisionPrompt(skill: string): string {
+  return `${skill}
+
+---
+
+You are performing ONE step of this skill: creating the agent's wallet. Nothing else.
+
+Your shell already starts in the runner directory. Do not cd anywhere.
+
+Create a fresh EVM keypair and write it to ${WALLET_FILE} in that directory, as JSON with
+exactly two keys: "address" (0x + 40 hex chars) and "privateKey" (0x + 64 hex chars).
+
+Generate it with a real tool — 'cast wallet new', or a bun script using
+privateKeyToAccount and generatePrivateKey from viem/accounts (viem is already installed
+in node_modules). NEVER write a key you composed yourself, and never reuse an example key
+from documentation: the mandate will be signed to this address, so a guessable key is a
+broken agent. The caller verifies that the private key really derives the address and
+rejects known-weak values.
+
+Then call done(). Do not run the limit order.`
+}
+
 function systemPrompt(skill: string, instruction: string): string {
   return `${skill}
 
@@ -142,24 +166,34 @@ ${instruction}`
 }
 
 async function main(): Promise<void> {
-  const [instructionPath] = process.argv.slice(2)
+  const [arg] = process.argv.slice(2)
   if (!apiKey) throw new Error('OG_ROUTER_API_KEY is not set')
-  if (!instructionPath) throw new Error('usage: bun server/og-agent.ts <instruction.json>')
-  if (!existsSync(instructionPath)) throw new Error(`instruction not found: ${instructionPath}`)
   if (!existsSync(SKILL_PATH)) throw new Error(`skill not found: ${SKILL_PATH}`)
-
   const skill = readFileSync(SKILL_PATH, 'utf8')
-  const instruction = readFileSync(instructionPath, 'utf8')
 
-  // Put the instruction where the runner expects it. It is also in the prompt, and the
-  // model will happily rewrite it from there — but a mandate the model retyped is a
-  // mandate the model can mistype.
-  writeFileSync(join(resolve(WORKDIR), 'instruction.json'), instruction)
+  const provisioning = arg === '--provision'
+  let messages: Message[]
 
-  const messages: Message[] = [
-    { role: 'system', content: systemPrompt(skill, instruction) },
-    { role: 'user', content: 'Run the limit order described in the instruction. Begin.' },
-  ]
+  if (provisioning) {
+    messages = [
+      { role: 'system', content: provisionPrompt(skill) },
+      { role: 'user', content: `Create the agent wallet and write ${WALLET_FILE}. Begin.` },
+    ]
+  } else {
+    if (!arg) throw new Error('usage: bun server/og-agent.ts <instruction.json> | --provision')
+    if (!existsSync(arg)) throw new Error(`instruction not found: ${arg}`)
+    const instruction = readFileSync(arg, 'utf8')
+
+    // Put the instruction where the runner expects it. It is also in the prompt, and the
+    // model will happily rewrite it from there — but a mandate the model retyped is a
+    // mandate the model can mistype.
+    writeFileSync(join(resolve(WORKDIR), 'instruction.json'), instruction)
+
+    messages = [
+      { role: 'system', content: systemPrompt(skill, instruction) },
+      { role: 'user', content: 'Run the limit order described in the instruction. Begin.' },
+    ]
+  }
 
   console.log(`og-agent → ${MODEL} @ ${ROUTER_URL}, cwd=${WORKDIR}, max ${MAX_STEPS} steps`)
 

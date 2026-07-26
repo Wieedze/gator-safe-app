@@ -5,7 +5,7 @@ import { useUniswapPools } from '../hooks/useUniswapPools'
 import { buildDepositPlan } from '../lib/uniswapPosition'
 import { buildYieldDelegations, buildStoredYieldPlan, type StoredYieldPlan } from '../lib/yieldDelegations'
 import { buildCompoundMandate, buildStoredCompoundDelegation, type CompoundMode, type StoredCompoundDelegation } from '../lib/compoundDelegation'
-import { checkCompoundApprovals, buildCompoundApprovalTxs } from '../lib/compoundApproval'
+import { readCompoundAllowances, buildCompoundApprovalTxs, type TokenAllowance } from '../lib/compoundApproval'
 import { buildDelegationTypedData } from '../lib/delegations'
 import { getEnvironment } from '../lib/environment'
 import { getAddresses } from '../config/addresses'
@@ -19,6 +19,7 @@ import { poolValueShare, type PoolInfo } from '../lib/uniswapDiscovery'
  * salt-verifiable terms, so the agent needs no out-of-band interval config). */
 type YieldPlanWithCompound = StoredYieldPlan & { compound?: StoredCompoundDelegation }
 import { buildYieldRedeemTxs } from '../lib/redeemYield'
+import { findCompoundablePosition, buildCompoundRedeemTx } from '../lib/redeemCompound'
 import { Card, Btn, Mono, CopyChip } from '../ui/components'
 import { Block, Field, Segmented } from '../ui/form'
 import { dec } from '../lib/numeric-input'
@@ -87,10 +88,12 @@ export default function Yield() {
   const [autoCompound, setAutoCompound] = useState(false)
   const [compoundMode, setCompoundMode] = useState<CompoundMode>('agent')
   const [compoundIntervalDays, setCompoundIntervalDays] = useState(30)
-  // null = not checked yet; [] = the Safe already has a standing approval on both
-  // tokens; non-empty = these still need the one-time approve() before the compound
-  // agent can pull harvested fees (see src/lib/compoundApproval.ts).
-  const [compoundApprovalsNeeded, setCompoundApprovalsNeeded] = useState<Address[] | null>(null)
+  // Live on-chain allowances (Safe -> PositionManager); null = not checked yet.
+  const [compoundAllowances, setCompoundAllowances] = useState<TokenAllowance[] | null>(null)
+  // The operator's own cap per token — bounded, never maxUint256 (IMPLEMENTATION_PLAN.md:
+  // "don't ship unbounded authority to mainnet"). Prefilled once per pool, editable after.
+  const [compoundCap0, setCompoundCap0] = useState('')
+  const [compoundCap1, setCompoundCap1] = useState('')
   const [approvingCompound, setApprovingCompound] = useState(false)
   const [approveError, setApproveError] = useState<string | null>(null)
   // Who redeems: 'agent' delegates to an external agent wallet (a bot runs it);
@@ -99,6 +102,9 @@ export default function Yield() {
   const [redeemMode, setRedeemMode] = useState<'agent' | 'manual'>('agent')
   const [redeeming, setRedeeming] = useState(false)
   const [redeemDone, setRedeemDone] = useState(false)
+  const [compoundingNow, setCompoundingNow] = useState(false)
+  const [compoundRedeemError, setCompoundRedeemError] = useState<string | null>(null)
+  const [compoundResult, setCompoundResult] = useState<{ fees0: bigint; fees1: bigint } | null>(null)
 
   const recommended = pools[0] ?? null
   const pool = selectedPool ?? recommended
@@ -136,12 +142,12 @@ export default function Yield() {
 
   useEffect(() => {
     if (!pool || !autoCompound) {
-      setCompoundApprovalsNeeded(null)
+      setCompoundAllowances(null)
       return
     }
     const positionManager = UNISWAP_V3_POSITION_MANAGER[safe.chainId]
     if (!positionManager) {
-      setCompoundApprovalsNeeded(null)
+      setCompoundAllowances(null)
       return
     }
     let cancelled = false
@@ -150,13 +156,34 @@ export default function Yield() {
       if (!chain) return
       const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
       const safeAddress = safe.safeAddress as Address
-      const missing = await checkCompoundApprovals(client, safeAddress, positionManager, [pool.token0.address, pool.token1.address])
-      if (!cancelled) setCompoundApprovalsNeeded(missing)
+      const allowances = await readCompoundAllowances(client, safeAddress, positionManager, [pool.token0.address, pool.token1.address])
+      if (!cancelled) setCompoundAllowances(allowances)
     })()
     return () => {
       cancelled = true
     }
   }, [pool, autoCompound, safe.chainId, safe.safeAddress])
+
+  const compoundCap0Raw = (() => {
+    if (!pool || !compoundCap0) return 0n
+    try { return parseUnits(compoundCap0, pool.token0.decimals) } catch { return 0n }
+  })()
+  const compoundCap1Raw = (() => {
+    if (!pool || !compoundCap1) return 0n
+    try { return parseUnits(compoundCap1, pool.token1.decimals) } catch { return 0n }
+  })()
+  // A token "needs" approving when the operator hasn't set a (positive) cap yet, or the
+  // live allowance doesn't cover the cap they set — either way, nothing to send until
+  // they type a number themselves (see compoundApproval.ts: no invented default).
+  const compoundApprovalsNeeded =
+    !autoCompound || !pool || !compoundAllowances
+      ? null
+      : compoundAllowances
+          .filter((a) => {
+            const cap = a.token === pool.token0.address ? compoundCap0Raw : compoundCap1Raw
+            return cap === 0n || a.allowance < cap
+          })
+          .map((a) => a.token)
 
   async function handleApproveCompound() {
     if (!pool) return
@@ -165,7 +192,11 @@ export default function Yield() {
     setApproveError(null)
     setApprovingCompound(true)
     try {
-      const txs = buildCompoundApprovalTxs(positionManager, compoundApprovalsNeeded)
+      const amounts = compoundApprovalsNeeded.map((token) => ({
+        token,
+        amount: token === pool.token0.address ? compoundCap0Raw : compoundCap1Raw,
+      }))
+      const txs = buildCompoundApprovalTxs(positionManager, amounts)
       await sdk.txs.send({ txs })
       // The Safe's own multisig confirms + executes this asynchronously (it is a
       // real transaction, not an off-chain signature) — re-check rather than
@@ -173,8 +204,8 @@ export default function Yield() {
       const chain = findChain(safe.chainId)
       if (chain) {
         const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
-        const missing = await checkCompoundApprovals(client, safe.safeAddress as Address, positionManager, [pool.token0.address, pool.token1.address])
-        setCompoundApprovalsNeeded(missing)
+        const allowances = await readCompoundAllowances(client, safe.safeAddress as Address, positionManager, [pool.token0.address, pool.token1.address])
+        setCompoundAllowances(allowances)
       }
     } catch (err) {
       setApproveError(err instanceof Error ? err.message : 'Failed to send the approval transaction')
@@ -340,6 +371,37 @@ export default function Yield() {
       setPlanError(err instanceof Error ? err.message : 'Failed to redeem the deposit')
     } finally {
       setRedeeming(false)
+    }
+  }
+
+  // Manual compound: read the Safe's live position + owed fees, then redeem collect +
+  // increaseLiquidity as one atomic Safe tx (Manual mode — the Safe is the delegate).
+  // Unlike deposit, the amounts aren't known until this call (see redeemCompound.ts).
+  async function handleCompoundNow() {
+    if (!storedPlan?.compound || !pool) return
+    const positionManager = storedPlan.compound.meta.targetAddress
+    if (!positionManager) {
+      setCompoundRedeemError('The compound mandate is missing its PositionManager target')
+      return
+    }
+    setCompoundRedeemError(null)
+    setCompoundingNow(true)
+    try {
+      const chain = findChain(safe.chainId)
+      if (!chain) throw new Error(`Unsupported chain: ${safe.chainId}`)
+      const client = createPublicClient({ chain, transport: http(rpcUrl(safe.chainId)) })
+      const position = await findCompoundablePosition(client, positionManager, safeAddress, {
+        token0: pool.token0.address,
+        token1: pool.token1.address,
+        fee: pool.fee,
+      })
+      const tx = buildCompoundRedeemTx(safe.chainId, storedPlan.compound.delegation, positionManager, safeAddress, position)
+      await sdk.txs.send({ txs: [tx] })
+      setCompoundResult({ fees0: position.fees0, fees1: position.fees1 })
+    } catch (err) {
+      setCompoundRedeemError(err instanceof Error ? err.message : 'Failed to compound')
+    } finally {
+      setCompoundingNow(false)
     }
   }
 
@@ -530,24 +592,52 @@ export default function Yield() {
             />
 
             {autoCompound && compoundApprovalsNeeded && compoundApprovalsNeeded.length > 0 && (
-              <div className="rounded-xl glass-soft ring-1 ring-line p-4 space-y-2">
+              <div className="rounded-xl glass-soft ring-1 ring-line p-4 space-y-3">
                 <div className="flex items-center gap-2 text-sm font-medium text-ink">
                   <IconAlert size={16} /> One-time approval needed for auto-compound
                 </div>
                 <p className="text-xs text-dim leading-relaxed">
                   Harvesting fees pulls them back into the position via <Mono className="text-dim">increaseLiquidity</Mono>,
-                  which needs a standing approval from the Safe on{' '}
-                  {compoundApprovalsNeeded
-                    .map((t) => (t === pool.token0.address ? pool.token0.symbol : pool.token1.symbol))
-                    .join(' and ')}{' '}
-                  first — a real Safe transaction, not a delegation, so it goes through your Safe's own signers.
+                  which needs a standing approval from the Safe — bounded to a cap you set (never unlimited), a real Safe
+                  transaction, not a delegation, so it goes through your Safe's own signers.
+                </p>
+                <div className="grid grid-cols-2 gap-4">
+                  <Field label={`Approve up to (${pool.token0.symbol})`} required missing={compoundCap0 !== '' && compoundCap0Raw === 0n}>
+                    <input
+                      type="text" inputMode="decimal"
+                      value={compoundCap0}
+                      onChange={(e) => setCompoundCap0(dec(e.target.value))}
+                      placeholder={amount0 ? (Number(amount0) * 10).toString() : '0.00'}
+                      aria-label={`Approve up to, ${pool.token0.symbol}`}
+                      className="font-mono"
+                    />
+                  </Field>
+                  <Field label={`Approve up to (${pool.token1.symbol})`} required missing={compoundCap1 !== '' && compoundCap1Raw === 0n}>
+                    <input
+                      type="text" inputMode="decimal"
+                      value={compoundCap1}
+                      onChange={(e) => setCompoundCap1(dec(e.target.value))}
+                      placeholder={amount1 ? (Number(amount1) * 10).toString() : '0.00'}
+                      aria-label={`Approve up to, ${pool.token1.symbol}`}
+                      className="font-mono"
+                    />
+                  </Field>
+                </div>
+                <p className="text-[11px] text-faint leading-relaxed">
+                  This is a lifetime cap <Mono className="text-faint">increaseLiquidity</Mono> draws down as it reinvests
+                  fees — not a per-cycle amount. Set it generously enough to cover many compounds; you can raise it again
+                  later if it runs out.
                 </p>
                 {approveError && (
                   <div className="flex items-center gap-2 text-pending text-sm">
                     <IconAlert size={16} /> {approveError}
                   </div>
                 )}
-                <Btn kind="primary" onClick={handleApproveCompound} disabled={approvingCompound}>
+                <Btn
+                  kind="primary"
+                  onClick={handleApproveCompound}
+                  disabled={approvingCompound || compoundCap0Raw === 0n || compoundCap1Raw === 0n}
+                >
                   {approvingCompound ? 'Sending…' : 'Approve PositionManager'}
                 </Btn>
               </div>
@@ -575,8 +665,31 @@ export default function Yield() {
 
                 {redeemMode === 'manual' ? (
                   redeemDone ? (
-                    <div className="flex items-center gap-2 text-sm font-medium text-active">
-                      <IconCheck size={16} /> Deposit redeemed — position minted to the Safe.
+                    <div className="space-y-3">
+                      <div className="flex items-center gap-2 text-sm font-medium text-active">
+                        <IconCheck size={16} /> Deposit redeemed — position minted to the Safe.
+                      </div>
+                      {storedPlan.compound && (
+                        <div className="rounded-lg bg-raised ring-1 ring-line p-3 space-y-2">
+                          <div className="text-[11px] text-faint uppercase tracking-wide">Compound (manual)</div>
+                          {compoundResult ? (
+                            <div className="text-xs text-dim">
+                              Harvested {formatUnits(compoundResult.fees0, pool.token0.decimals)} {pool.token0.symbol} +{' '}
+                              {formatUnits(compoundResult.fees1, pool.token1.decimals)} {pool.token1.symbol}, reinvested into the position.
+                            </div>
+                          ) : (
+                            <p className="text-xs text-faint">Collects owed fees and reinvests them into this position, right now.</p>
+                          )}
+                          {compoundRedeemError && (
+                            <div className="flex items-center gap-2 text-pending text-sm">
+                              <IconAlert size={16} /> {compoundRedeemError}
+                            </div>
+                          )}
+                          <Btn kind="primary" onClick={handleCompoundNow} disabled={compoundingNow}>
+                            {compoundingNow ? 'Compounding…' : 'Compound now'}
+                          </Btn>
+                        </div>
+                      )}
                     </div>
                   ) : (
                     <div className="flex items-center gap-2">

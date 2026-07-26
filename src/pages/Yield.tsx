@@ -7,6 +7,8 @@ import { buildYieldDelegations, buildStoredYieldPlan, type YieldDelegation, type
 import { useAgentRun } from '../hooks/useAgentRun'
 import { useSafeYieldPlans } from '../hooks/useSafeYieldPlans'
 import { useSafePositions } from '../hooks/useSafePositions'
+import { buildRevokePlanTxs } from '../lib/revoke'
+import type { StoredDelegation } from '../lib/storage'
 import { Positions } from '../ui/Positions'
 import { finalizePending } from '../hooks/useFinalizePending'
 import { discoverIncomingDelegations } from '../lib/intuition/discover'
@@ -141,6 +143,7 @@ export default function Yield() {
   const [fundingAgent, setFundingAgent] = useState(false)
   const [publishing, setPublishing] = useState(false)
   const [publishStatus, setPublishStatus] = useState<string | null>(null)
+  const [revokingPlan, setRevokingPlan] = useState<string | null>(null)
   const [redeeming, setRedeeming] = useState(false)
   const [redeemDone, setRedeemDone] = useState(false)
   const [compoundingNow, setCompoundingNow] = useState(false)
@@ -478,6 +481,22 @@ export default function Yield() {
   // increaseLiquidity as one atomic Safe tx (Manual mode — the Safe is the delegate).
   // Unlike deposit, the amounts aren't known until this call (see redeemCompound.ts).
 
+
+  /** Revoke every step at once. Two of three revoked leaves an agent that can still
+   *  spend the rest, so they go in one Safe transaction — one signature, or none. */
+  async function handleRevokePlan(agentAddress: Address, steps: { delegation: StoredDelegation }[]) {
+    setPlanError(null)
+    setRevokingPlan(agentAddress)
+    try {
+      await sdk.txs.send({ txs: buildRevokePlanTxs(steps.map((st) => st.delegation), safe.chainId) })
+      safePlans.refresh()
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Failed to revoke the plan')
+    } finally {
+      setRevokingPlan(null)
+    }
+  }
+
   const AGENT_GAS_ETH = '0.0015'
 
   /** Gas for the agent, its own Safe transaction — three redeems, so more than a
@@ -679,11 +698,26 @@ export default function Yield() {
                     </div>
                     <Mono className="text-[11px] text-faint">{short(pl.agentAddress)}</Mono>
                   </div>
-                  {pl.complete && (
-                    <Btn kind="ghost" size="sm" onClick={() => agentSvc.adopt(pl.agentAddress)}>
-                      Resume
+                  <div className="flex items-center gap-2 shrink-0">
+                    {pl.complete && (
+                      <Btn kind="ghost" size="sm" onClick={() => agentSvc.adopt(pl.agentAddress)}>
+                        Resume
+                      </Btn>
+                    )}
+                    {/* Revoke makes the mandate unusable on-chain; Clear only hides an
+                        abandoned attempt. Different consequences, so different actions. */}
+                    <Btn
+                      kind="ghost"
+                      size="sm"
+                      onClick={() => void handleRevokePlan(pl.agentAddress, pl.steps)}
+                      disabled={revokingPlan === pl.agentAddress}
+                    >
+                      {revokingPlan === pl.agentAddress ? 'Revoking…' : 'Revoke'}
                     </Btn>
-                  )}
+                    <Btn kind="ghost" size="sm" onClick={() => safePlans.dismiss(pl.agentAddress)}>
+                      Clear
+                    </Btn>
+                  </div>
                 </div>
               )
             })}

@@ -245,11 +245,30 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
         </div>
       )}
 
+      {/* Liquidity positions — read from the chain, so they survive a reload and show up
+          whoever minted them. */}
+      {(positions.positions.length > 0 || positions.loading) && (
+        <div className="mb-6">
+          <div className="flex items-end justify-between gap-4 mb-3">
+            <div>
+              <h2 className="text-lg font-bold tracking-tight text-ink">Agentic DeFi strategies</h2>
+              <p className="text-dim text-xs mt-0.5">Positions an agent opened and manages under a capped mandate.</p>
+            </div>
+            <Btn kind="ghost" onClick={() => onNavigate('yield')}>Manage</Btn>
+          </div>
+          <Positions positions={positions.positions} loading={positions.loading} />
+        </div>
+      )}
+
+      {/* Separated because they answer different questions: strategies are what an
+          agent runs on the treasury, operations are what the treasury pays out. */}
+      <div className="border-t border-line mb-6" />
+
       {/* Header */}
       <div className="flex items-end justify-between gap-4 mb-6">
         <div>
-          <h1 className="text-2xl font-extrabold tracking-tight text-ink">Subscriptions</h1>
-          <p className="text-dim text-sm mt-1">Recurring USDC charges, capped on-chain.</p>
+          <h1 className="text-2xl font-extrabold tracking-tight text-ink">Operations</h1>
+          <p className="text-dim text-sm mt-1">Subscriptions, streams and orders — each capped on-chain.</p>
         </div>
         <Btn kind="primary" icon={<IconPlus size={18} />} onClick={() => onNavigate('create')}>New subscription</Btn>
       </div>
@@ -263,22 +282,7 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
         </Card>
       </div>
 
-      {/* Liquidity positions — read from the chain, so they survive a reload and show up
-          whoever minted them. */}
-      {(positions.positions.length > 0 || positions.loading) && (
-        <div className="mb-6">
-          <div className="flex items-end justify-between gap-4 mb-3">
-            <div>
-              <h2 className="text-lg font-bold tracking-tight text-ink">Investments</h2>
-              <p className="text-dim text-xs mt-0.5">Liquidity held by this Safe.</p>
-            </div>
-            <Btn kind="ghost" onClick={() => onNavigate('yield')}>Manage</Btn>
-          </div>
-          <Positions positions={positions.positions} loading={positions.loading} />
-        </div>
-      )}
-
-      {/* Subscriptions grid */}
+      {/* Operations */}
       {subs.length === 0 ? (
         <Card className="p-8 text-center">
           <p className="text-dim text-sm">No subscriptions yet.</p>

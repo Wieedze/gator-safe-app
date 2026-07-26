@@ -1,10 +1,10 @@
-import { useEffect, useState, useMemo } from 'react'
+import { useEffect, useState, useMemo, useRef } from 'react'
 import { useSafeAppsSDK } from '@safe-global/safe-apps-react-sdk'
 import { createPublicClient, http, isAddress, parseUnits, formatUnits, erc20Abi, type Address, type Hex } from 'viem'
 import { useUniswapPools } from '../hooks/useUniswapPools'
-import { buildDepositPlan } from '../lib/uniswapPosition'
-import { buildYieldDelegations, buildStoredYieldPlan, type StoredYieldPlan } from '../lib/yieldDelegations'
-import { buildCompoundMandate, buildStoredCompoundDelegation, type CompoundMode, type StoredCompoundDelegation } from '../lib/compoundDelegation'
+import { buildDepositPlan, type DepositPlan } from '../lib/uniswapPosition'
+import { buildYieldDelegations, buildStoredYieldPlan, type YieldDelegation, type StoredYieldPlan } from '../lib/yieldDelegations'
+import { buildCompoundMandate, buildStoredCompoundDelegation, type CompoundMandate, type CompoundMode, type StoredCompoundDelegation } from '../lib/compoundDelegation'
 import { readCompoundAllowances, buildCompoundApprovalTxs, type TokenAllowance } from '../lib/compoundApproval'
 import { buildDelegationTypedData } from '../lib/delegations'
 import { getEnvironment } from '../lib/environment'
@@ -55,14 +55,16 @@ function estimatePositionValueUsd(
 // redeemable short rather than open-ended.
 const DEADLINE_SECONDS = 3600
 
-type DelegateStep = 'idle' | 'preparing' | 'signing' | 'done'
+// 'ready-for-next' = one signature done, more remain. Firing the next
+// signTypedMessage automatically (even after a delay) can race Safe's own
+// confirmation screen — click "Continue" there and the app can look like it
+// dropped out, only to resurface once whatever Safe was doing settles. Pacing
+// the next request on the operator's own button click instead removes the race
+// entirely: nothing fires until they're done with Safe's UI.
+type DelegateStep = 'idle' | 'preparing' | 'signing' | 'ready-for-next' | 'done'
 
-// The Safe parent window needs a moment to close/reset its sign-message modal
-// before it reliably opens the next one — firing signTypedMessage calls back
-// to back can leave that second request stuck with no visible prompt.
-const SIGN_SETTLE_MS = 800
-// Safety net so a genuinely stuck Safe-side modal fails loudly instead of
-// leaving the button on "Signing N of 3…" forever with no way to recover.
+// Safety net so a genuinely stuck Safe-side modal fails loudly instead of leaving
+// the button on "Signing N of…" forever with no way to recover.
 const SIGN_TIMEOUT_MS = 120_000
 
 function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
@@ -71,8 +73,6 @@ function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promi
     new Promise<never>((_, reject) => setTimeout(() => reject(new Error(message)), ms)),
   ])
 }
-
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 export default function Yield() {
   const { sdk, safe } = useSafeAppsSDK()
@@ -85,6 +85,15 @@ export default function Yield() {
   const [signingIndex, setSigningIndex] = useState(0)
   const [planError, setPlanError] = useState<string | null>(null)
   const [storedPlan, setStoredPlan] = useState<YieldPlanWithCompound | null>(null)
+  // Everything the paced signing flow needs across steps — a ref because updating
+  // it must never itself trigger a render; `step`/`signingIndex` state do that.
+  const pendingSignRef = useRef<{
+    plan: DepositPlan
+    moduleAddress: Address
+    yieldDelegations: YieldDelegation[]
+    compoundMandate: CompoundMandate | null
+    signatures: Hex[]
+  } | null>(null)
   const [autoCompound, setAutoCompound] = useState(false)
   const [compoundMode, setCompoundMode] = useState<CompoundMode>('agent')
   const [compoundIntervalDays, setCompoundIntervalDays] = useState(30)
@@ -264,6 +273,9 @@ export default function Yield() {
   const projectionApr = pool?.apy ?? DEFAULT_PROJECTION_APR
   const aprIsEstimate = pool?.apy == null
 
+  /** Prepares the plan + all delegations to sign, then signs the first one. Each
+   * further signature is fired only when the operator clicks "Continue" (see
+   * `signNextStep`) — see the DelegateStep comment for why this isn't automatic. */
   async function handleDelegate() {
     if (!pool || !delegateAddress) return
     setPlanError(null)
@@ -302,42 +314,14 @@ export default function Yield() {
         deadlineSeconds: DEADLINE_SECONDS,
       })
 
-      setStep('signing')
-      const signatures: Hex[] = []
-      for (let i = 0; i < yieldDelegations.length; i++) {
-        setSigningIndex(i)
-        if (i > 0) await sleep(SIGN_SETTLE_MS)
-        const typedData = buildDelegationTypedData(yieldDelegations[i].delegation, safe.chainId)
-        // sdk.txs.signTypedMessage's parameter type doesn't match our EIP-712 typed-data
-        // shape (same cast as the existing CreateDelegation.tsx signing flow); its
-        // resolved value is likewise typed loosely by the SDK, narrowed to the two
-        // fields this app actually reads off it.
-        const result = (await withTimeout(
-          sdk.txs.signTypedMessage(typedData as never),
-          SIGN_TIMEOUT_MS,
-          `Timed out waiting for signature ${i + 1} of ${yieldDelegations.length}. Check your wallet extension for a pending request, or the Safe app's Messages tab, then try again.`,
-        )) as { signature?: Hex; safeTxHash?: Hex }
-        // Both fields are already hex strings from the SDK; '0x' is the empty-signature fallback.
-        signatures.push((result?.signature || result?.safeTxHash || '0x') as Hex)
-      }
-
-      let finalPlan: YieldPlanWithCompound = buildStoredYieldPlan({
-        plan,
-        yieldDelegations,
-        signatures,
-        chainId: safe.chainId,
-        safeAddress,
-        moduleAddress,
-        agentAddress: delegateAddress,
-      })
-
-      // If the operator enabled auto-compound, sign one more standing delegation —
-      // bounded to collect + increaseLiquidity on this pool's PositionManager — and
-      // attach it to the plan. The agent redeems it repeatedly to harvest+reinvest.
+      // If the operator enabled auto-compound, one more standing delegation —
+      // bounded to collect + increaseLiquidity on this pool's PositionManager —
+      // joins the signing queue as its last step.
+      let compoundMandate: CompoundMandate | null = null
       if (autoCompound) {
         const positionManager = UNISWAP_V3_POSITION_MANAGER[safe.chainId]
         if (!positionManager) throw new Error(`Uniswap PositionManager not configured for chain ${safe.chainId}`)
-        const mandate = buildCompoundMandate({
+        compoundMandate = buildCompoundMandate({
           chainId: safe.chainId,
           agentAddress: delegateAddress,
           moduleAddress,
@@ -347,27 +331,84 @@ export default function Yield() {
           mode: compoundMode,
           intervalDays: compoundMode === 'manual' ? compoundIntervalDays : undefined,
         })
-        setSigningIndex(yieldDelegations.length)
-        await sleep(SIGN_SETTLE_MS)
-        const typedData = buildDelegationTypedData(mandate.delegation, safe.chainId)
-        const result = (await withTimeout(
-          sdk.txs.signTypedMessage(typedData as never),
-          SIGN_TIMEOUT_MS,
-          "Timed out waiting for the auto-compound signature. Check your wallet or the Safe app's Messages tab, then try again.",
-        )) as { signature?: Hex; safeTxHash?: Hex }
-        const signature = (result?.signature || result?.safeTxHash || '0x') as Hex
-        finalPlan = {
-          ...finalPlan,
-          compound: buildStoredCompoundDelegation({ mandate, signature, chainId: safe.chainId, safeAddress, moduleAddress }),
-        }
       }
 
-      setStoredPlan(finalPlan)
-      setStep('done')
+      pendingSignRef.current = { plan, moduleAddress, yieldDelegations, compoundMandate, signatures: [] }
+      setSigningIndex(0)
+      await signStep(0)
     } catch (err) {
       setPlanError(err instanceof Error ? err.message : 'Failed to build the delegation plan')
       setStep('idle')
     }
+  }
+
+  /** Signs one delegation (by index into yieldDelegations, then the compound
+   * mandate last, if any) and either pauses for the operator's "Continue" or,
+   * on the final step, assembles and stores the finished plan. */
+  async function signStep(index: number) {
+    const pending = pendingSignRef.current
+    if (!pending || !delegateAddress) return
+    const total = pending.yieldDelegations.length + (pending.compoundMandate ? 1 : 0)
+    setPlanError(null)
+    setStep('signing')
+    try {
+      const delegation =
+        index < pending.yieldDelegations.length
+          ? pending.yieldDelegations[index].delegation
+          : pending.compoundMandate!.delegation
+      const typedData = buildDelegationTypedData(delegation, safe.chainId)
+      // sdk.txs.signTypedMessage's parameter type doesn't match our EIP-712 typed-data
+      // shape (same cast as the existing CreateDelegation.tsx signing flow); its
+      // resolved value is likewise typed loosely by the SDK, narrowed to the two
+      // fields this app actually reads off it.
+      const result = (await withTimeout(
+        sdk.txs.signTypedMessage(typedData as never),
+        SIGN_TIMEOUT_MS,
+        `Timed out waiting for signature ${index + 1} of ${total}. Check your wallet extension for a pending request, or the Safe app's Messages tab, then try again.`,
+      )) as { signature?: Hex; safeTxHash?: Hex }
+      // Both fields are already hex strings from the SDK; '0x' is the empty-signature fallback.
+      pending.signatures.push((result?.signature || result?.safeTxHash || '0x') as Hex)
+
+      const nextIndex = index + 1
+      if (nextIndex < total) {
+        setSigningIndex(nextIndex)
+        setStep('ready-for-next')
+        return
+      }
+
+      let finalPlan: YieldPlanWithCompound = buildStoredYieldPlan({
+        plan: pending.plan,
+        yieldDelegations: pending.yieldDelegations,
+        signatures: pending.signatures.slice(0, pending.yieldDelegations.length),
+        chainId: safe.chainId,
+        safeAddress,
+        moduleAddress: pending.moduleAddress,
+        agentAddress: delegateAddress,
+      })
+      if (pending.compoundMandate) {
+        finalPlan = {
+          ...finalPlan,
+          compound: buildStoredCompoundDelegation({
+            mandate: pending.compoundMandate,
+            signature: pending.signatures[pending.yieldDelegations.length],
+            chainId: safe.chainId,
+            safeAddress,
+            moduleAddress: pending.moduleAddress,
+          }),
+        }
+      }
+      setStoredPlan(finalPlan)
+      setStep('done')
+      pendingSignRef.current = null
+    } catch (err) {
+      setPlanError(err instanceof Error ? err.message : 'Failed to sign')
+      setStep('idle')
+      pendingSignRef.current = null
+    }
+  }
+
+  function handleContinueSigning() {
+    void signStep(signingIndex)
   }
 
   function downloadPlan() {
@@ -737,8 +778,24 @@ export default function Yield() {
                   </div>
                 )}
               </div>
+            ) : step === 'ready-for-next' ? (
+              <div className="space-y-2">
+                <p className="text-xs text-dim">
+                  Signature {signingIndex} of {autoCompound ? 4 : 3} done. Finish with Safe's own confirmation screen
+                  first (its "Continue" is fine to click), then come back and continue here — the next request only
+                  fires when you do.
+                </p>
+                <Btn kind="primary" size="lg" onClick={handleContinueSigning}>
+                  Continue — sign {signingIndex + 1} of {autoCompound ? 4 : 3}
+                </Btn>
+              </div>
             ) : (
-              <Btn kind="primary" size="lg" onClick={handleDelegate} disabled={!canDelegate || step !== 'idle'}>
+              <Btn
+                kind="primary"
+                size="lg"
+                onClick={handleDelegate}
+                disabled={!canDelegate || step === 'preparing' || step === 'signing'}
+              >
                 {step === 'preparing'
                   ? 'Preparing…'
                   : step === 'signing'

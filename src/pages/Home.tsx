@@ -9,8 +9,8 @@ import { useFinalizePending } from '../hooks/useFinalizePending'
 import { portalAtomUrl } from '../lib/intuition'
 import { periodToSeconds, isPeriodType } from '../lib/enforcers'
 import { SubscriptionDetail } from './SubscriptionDetail'
-import { Card, Btn, StatusBadge, Payee, type Status } from '../ui/components'
-import { IconChip, IconCheck, IconPlus, IconRepeat, IconLock, IconCube, IconExt, IconAlert, IconArrowR } from '../ui/icons'
+import { Card, Btn, StatusBadge, Payee, Mono, type Status } from '../ui/components'
+import { IconChip, IconCheck, IconPlus, IconRepeat, IconLock, IconCube, IconExt, IconAlert, IconArrowR, IconClock } from '../ui/icons'
 import { findChain, rpcUrl } from '../config/supported-chains'
 
 type Page = 'home' | 'create' | 'redeem'
@@ -90,8 +90,9 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
   // Finalize-on-open: recover finalized delegations from the Safe tx-service and
   // index them, independent of when the Nth owner signed (ADR 0005).
   useFinalizePending()
-  const [moduleStatus, setModuleStatus] = useState<'loading' | 'installed' | 'not-installed' | 'error'>('loading')
+  const [moduleStatus, setModuleStatus] = useState<'loading' | 'installed' | 'pending' | 'not-installed' | 'error'>('loading')
   const [moduleAddress, setModuleAddress] = useState<Address | null>(null)
+  const [installTxHash, setInstallTxHash] = useState<string | null>(null)
   const [installing, setInstalling] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [safeInfo, setSafeInfo] = useState<{ owners: string[]; threshold: number } | null>(null)
@@ -109,9 +110,11 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [safe.safeAddress, safe.chainId])
 
-  async function checkModuleStatus() {
+  // `silent` re-checks without flashing the loading state, so the pending banner
+  // stays put while we poll for the signers to execute the batch.
+  async function checkModuleStatus({ silent = false }: { silent?: boolean } = {}) {
     try {
-      setModuleStatus('loading')
+      if (!silent) setModuleStatus('loading')
       const chain = findChain(safe.chainId)
       if (!chain) {
         setError(`Unsupported chain: ${safe.chainId}`)
@@ -140,7 +143,14 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
       } catch {
         // non-critical
       }
-      setModuleStatus(isEnabled ? 'installed' : 'not-installed')
+      if (isEnabled) {
+        setInstallTxHash(null)
+        setModuleStatus('installed')
+      } else {
+        // A queued install is still not enabled on-chain, so don't demote it
+        // back to 'not-installed' and offer the button again.
+        setModuleStatus((cur) => (cur === 'pending' ? 'pending' : 'not-installed'))
+      }
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Failed to check module status'
       setError(msg)
@@ -148,14 +158,33 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
     }
   }
 
+  // While the install batch sits in the Safe queue, poll for execution. The focus
+  // listener covers the common path: the user leaves to sign in the Safe UI and
+  // comes back expecting the banner to have caught up.
+  useEffect(() => {
+    if (moduleStatus !== 'pending') return
+    const recheck = () => { checkModuleStatus({ silent: true }) }
+    const id = setInterval(recheck, 12_000)
+    window.addEventListener('focus', recheck)
+    return () => {
+      clearInterval(id)
+      window.removeEventListener('focus', recheck)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [moduleStatus, safe.safeAddress, safe.chainId])
+
   async function installModule() {
     if (!moduleAddress) return
     setInstalling(true)
     setError(null)
     try {
       const txs = buildModuleInstallTxs(safe.safeAddress as Address, safe.chainId, moduleAddress)
-      await sdk.txs.send({ txs })
-      setModuleStatus('installed')
+      // txs.send resolves once the batch is proposed, not once it is executed.
+      // On a threshold > 1 Safe it then waits for the remaining signers, so the
+      // module is not usable yet and the UI must not claim that it is.
+      const res = await sdk.txs.send({ txs })
+      setInstallTxHash(res.safeTxHash)
+      setModuleStatus('pending')
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to propose module installation')
     } finally {
@@ -192,6 +221,29 @@ export default function Home({ onNavigate }: { onNavigate: (page: Page) => void 
               </div>
             </div>
           </div>
+        </div>
+      ) : moduleStatus === 'pending' ? (
+        <div className="flex items-center justify-between gap-4 rounded-2xl px-4 py-3 mb-6 glass-soft" style={{ background: 'rgba(251,191,36,.07)', boxShadow: 'inset 0 0 0 1px rgba(251,191,36,.22)' }}>
+          <div className="flex items-center gap-3 min-w-0">
+            <div className="grid place-items-center w-9 h-9 rounded-xl shrink-0" style={{ background: 'rgba(251,191,36,.14)', color: 'var(--color-pending)' }}>
+              <IconClock size={18} />
+            </div>
+            <div className="min-w-0">
+              <div className="text-sm font-semibold text-ink flex items-center gap-2">
+                Module installation proposed
+                <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-pending">awaiting signers</span>
+              </div>
+              <p className="text-xs text-dim mt-0.5 leading-relaxed">
+                Queued in the Safe{safeInfo ? ` — ${safeInfo.threshold} of ${safeInfo.owners.length} owners must confirm` : ''}. Execute it there and this updates on its own.
+              </p>
+              {installTxHash && (
+                <div className="text-xs text-faint mt-1 flex items-center gap-1.5">
+                  Safe tx <Mono className="text-xs text-dim">{short(installTxHash)}</Mono>
+                </div>
+              )}
+            </div>
+          </div>
+          <Btn kind="ghost" onClick={() => checkModuleStatus({ silent: true })} icon={<IconRepeat size={15} />}>Recheck</Btn>
         </div>
       ) : moduleStatus === 'not-installed' ? (
         <Card className="p-5 mb-6">
